@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import random
+import copy
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -35,7 +36,11 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 from engine_pretrain import train_one_epoch
-
+from util import (
+    load_checkpoint,
+    init_video_model,
+    init_opt,
+)
 
 def import_class(name):
     components = name.split('.')
@@ -121,6 +126,48 @@ def get_args_parser():
     return parser
 
 
+parser2 = argparse.ArgumentParser()
+parser2.add_argument(
+    '--fname', type=str,
+    help='name of config file to load',
+    default='./configs/pretrain/vitl16.yaml')
+parser2.add_argument(
+    '--devices', type=str, nargs='+', default=['cuda:0'],
+    help='which devices to use on local machine')
+argsv2 = parser2.parse_args()
+cfgs_mask = argsv2.get('mask')
+
+# -- MODEL
+cfgs_model = argsv2.get('model')
+model_name = cfgs_model.get('model_name')
+pred_depth = cfgs_model.get('pred_depth')
+pred_embed_dim = cfgs_model.get('pred_embed_dim')
+uniform_power = cfgs_model.get('uniform_power', True)
+use_mask_tokens = cfgs_model.get('use_mask_tokens', True)
+zero_init_mask_tokens = cfgs_model.get('zero_init_mask_tokens', True)
+
+# -- DATA
+# cfgs_data = argsv2.get('data')
+# dataset_type = cfgs_data.get('dataset_type', 'videodataset')
+# mask_type = cfgs_data.get('mask_type', 'multiblock3d')
+# dataset_paths = cfgs_data.get('datasets', [])
+# datasets_weights = cfgs_data.get('datasets_weights', None)
+# if datasets_weights is not None:
+#     assert len(datasets_weights) == len(dataset_paths), 'Must have one sampling weight specified for each dataset'
+# batch_size = cfgs_data.get('batch_size')
+# num_clips = cfgs_data.get('num_clips')
+# num_frames = cfgs_data.get('num_frames')
+# tubelet_size = cfgs_data.get('tubelet_size')
+# sampling_rate = cfgs_data.get('sampling_rate')
+# duration = cfgs_data.get('clip_duration', None)
+# crop_size = cfgs_data.get('crop_size', 224)
+# patch_size = cfgs_data.get('patch_size')
+# pin_mem = cfgs_data.get('pin_mem', False)
+# num_workers = cfgs_data.get('num_workers', 1)
+# filter_short_videos = cfgs_data.get('filter_short_videos', False)
+# decode_one_clip = cfgs_data.get('decode_one_clip', True)
+# log_resource_util_data = cfgs_data.get('log_resource_utilization', False)
+
 def main(args):
     print(torch.cuda.device_count())
     # if torch.cuda.is_available():
@@ -204,7 +251,37 @@ def main(args):
     
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    encoder, predictor = init_video_model(
+        uniform_power=uniform_power,
+        use_mask_tokens=use_mask_tokens,
+        num_mask_tokens=len(cfgs_mask),
+        zero_init_mask_tokens=zero_init_mask_tokens,
+        device=device,
+        patch_size=patch_size,
+        num_frames=num_frames,
+        tubelet_size=tubelet_size,
+        model_name=model_name,
+        crop_size=crop_size,
+        pred_depth=pred_depth,
+        pred_embed_dim=pred_embed_dim,
+        use_sdpa=use_sdpa,
+    )
+    target_encoder = copy.deepcopy(encoder)
+    # encoder = Encoder(**encoder_args).to(device)
+    # predictor = Predictor(**predictor_args).to(device)
+    encoder = encoder.to(device)
+    predictor = predictor.to(device)
+    
+    target_encoder = target_encoder.to(device)
+    for p in target_encoder.parameters():
+        p.requires_grad = False
+
+    # 定义优化器
+    optimizer = torch.optim.AdamW(
+        list(encoder.parameters()) + list(predictor.parameters()),
+        lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay
+    )
+    loss_scaler = NativeScaler()
     print(optimizer)
     loss_scaler = NativeScaler()
 
@@ -215,8 +292,8 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, data_loader_train,
+        train_one_epoch2(
+            encoder, predictor, target_encoder, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
             args=args
@@ -239,7 +316,42 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
+def train_one_epoch2(encoder, predictor, target_encoder, data_loader, optimizer, device, epoch, loss_scaler, log_writer=None, args=None):
+    encoder.train()
+    predictor.train()
 
+    for step, batch in enumerate(data_loader):
+        # 获取输入数据和遮罩
+        inputs, masks = batch
+        inputs = inputs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+
+        # 前向传播
+        with torch.cuda.amp.autocast(enabled=args.enable_amp):
+            # 编码器输出
+            encoder_output = encoder(inputs, masks)
+            # 目标编码器输出
+            with torch.no_grad():
+                target_output = target_encoder(inputs, masks)
+            # 预测器输出
+            predictor_output = predictor(encoder_output)
+            # 计算损失
+            loss = compute_loss(predictor_output, target_output)
+
+        # 反向传播和优化器步骤
+        optimizer.zero_grad()
+        loss_scaler(loss, optimizer, parameters=list(encoder.parameters()) + list(predictor.parameters()))
+        # 更新目标编码器（例如使用指数移动平均）
+        update_target_encoder(encoder, target_encoder, args.momentum)
+
+# 定义损失函数和目标编码器更新函数
+def compute_loss(predictor_output, target_output):
+    loss = torch.mean((predictor_output - target_output) ** 2)
+    return loss
+
+def update_target_encoder(encoder, target_encoder, momentum):
+    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+        param_k.data.mul_(momentum).add_(param_q.data * (1. - momentum))
 if __name__ == '__main__':
     parser = get_args_parser()
     
