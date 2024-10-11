@@ -1,8 +1,6 @@
 # --------------------------------------------------------
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) Meta Platforms, Inc.
 # All rights reserved.
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
 # --------------------------------------------------------
 
 # References:
@@ -20,7 +18,7 @@ import time
 from pathlib import Path
 import random
 import copy
-
+from src.masks.utils import apply_masks
 from src.utils.tensors import repeat_interleave_batch
 import torch
 import torch.backends.cudnn as cudnn
@@ -33,11 +31,7 @@ import timm.optim.optim_factory as optim_factory
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from engine_pretrain import train_one_epoch
-from vjepa.utils import (
-    load_checkpoint,
-    init_video_model,
-    init_opt,
-)
+from util import load_checkpoint, init_video_model, init_opt
 from src.utils.logging import (
     CSVLogger,
     gpu_timer,
@@ -47,7 +41,7 @@ from src.utils.logging import (
     AverageMeter
 )
 
-
+from model_mamp.transformer import Transformer as MAMPTransformer
 def import_class(name):
     """Dynamically import a class from a string name."""
     components = name.split('.')
@@ -157,8 +151,7 @@ def merge_configs(main_config, additional_config):
     merged = copy.deepcopy(main_config)
     for key, value in additional_config.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            # merged[key].update(value)
-            continue
+            merged[key].update(value)
         else:
             merged[key] = value
     return merged
@@ -178,33 +171,60 @@ def initialize_model(args, device, cfgs_mask):
     ModelClass = import_class(args.model)
     model = ModelClass(**args.model_args)
     model.to(device)
-    
-    # If using DistributedDataParallel
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
-        model_without_ddp = model.module
-    else:
-        model_without_ddp = model
-    
-    # Set up optimizer with weight decay for specific parameters
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
-    
-    # Initialize video model components
-    encoder, predictor = init_video_model(
-        uniform_power=args.model_args.get('uniform_power', True),
-        use_mask_tokens=args.model_args.get('use_mask_tokens', True),
-        num_mask_tokens=len(cfgs_mask),
-        zero_init_mask_tokens=args.model_args.get('zero_init_mask_tokens', True),
-        device=device,
-        patch_size=args.model_args.get('patch_size', 16),
-        num_frames=args.model_args.get('num_frames', 8),
-        tubelet_size=args.model_args.get('tubelet_size', 2),
-        model_name=args.model_args.get('model_name', 'vit_large_patch16'),
-        crop_size=args.model_args.get('crop_size', 224),
-        pred_depth=args.model_args.get('pred_depth', 1),
-        pred_embed_dim=args.model_args.get('pred_embed_dim', 256),
-        use_sdpa=args.model_args.get('use_sdpa', False),
+    model2 = MAMPTransformer(
+        dim_in=3,
+        dim_feat=256,
+        decoder_dim_feat=256,
+        depth=5,
+        decoder_depth=5,
+        num_heads=8,
+        mlp_ratio=4,
+        num_frames=120,
+        num_joints=25,
+        patch_size=1,
+        t_patch_size=4,
+        qkv_bias=True,
+        qk_scale=None,
+        drop_rate=0.,
+        attn_drop_rate=0.,
+        drop_path_rate=0.,
+        norm_layer=torch.nn.LayerNorm,
+        norm_skes_loss=False
     )
+    model2.to(device)
+
+    # If using DistributedDataParallel
+    # if args.distributed:
+    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
+    #     model_without_ddp = model.module
+    # else:
+    #     model_without_ddp = model
+    if args.distributed:
+        model2 = torch.nn.parallel.DistributedDataParallel(model2, device_ids=[args.local_rank], find_unused_parameters=True)
+        model_without_ddp = model2.module
+    else:
+        model_without_ddp = model2
+    encoder=model_without_ddp.encoder
+    
+    # # Set up optimizer with weight decay for specific parameters
+    # param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    
+    # # Initialize video model components
+    # encoder, predictor = init_video_model(
+    #     uniform_power=args.model_args.get('uniform_power', True),
+    #     use_mask_tokens=args.model_args.get('use_mask_tokens', True),
+    #     num_mask_tokens=len(cfgs_mask),
+    #     zero_init_mask_tokens=args.model_args.get('zero_init_mask_tokens', True),
+    #     device=device,
+    #     patch_size=args.model_args.get('patch_size', 16),
+    #     num_frames=args.model_args.get('num_frames', 8),
+    #     tubelet_size=args.model_args.get('tubelet_size', 2),
+    #     model_name=args.model_args.get('model_name', 'vit_large_patch16'),
+    #     crop_size=args.model_args.get('crop_size', 224),
+    #     pred_depth=args.model_args.get('pred_depth', 1),
+    #     pred_embed_dim=args.model_args.get('pred_embed_dim', 256),
+    #     use_sdpa=args.model_args.get('use_sdpa', False),
+    # )
     
     # Initialize target encoder
     target_encoder = copy.deepcopy(encoder)
@@ -270,9 +290,19 @@ def initialize_logging(args):
     return log_writer
 
 
-def compute_loss(predictor_output, target_output):
-    """Compute Mean Squared Error loss."""
-    return torch.mean((predictor_output - target_output) ** 2)
+def compute_loss(z_list, h_list, loss_exp, masks_pred):
+    """Compute the JEPA prediction loss."""
+    loss = 0.0
+    # Compute loss and accumulate for each mask-enc/mask-pred pair
+    for zi, hi in zip(z_list, h_list):
+        loss += torch.mean(torch.abs(zi - hi) ** loss_exp) / loss_exp
+    loss /= len(masks_pred)
+    return loss
+
+
+def regularization_loss(z_list):
+    """Compute the regularization loss."""
+    return sum([torch.sqrt(zi.var(dim=1) + 0.0001).mean() for zi in z_list]) / len(z_list)
 
 
 def update_target_encoder(encoder, target_encoder, momentum):
@@ -281,77 +311,111 @@ def update_target_encoder(encoder, target_encoder, momentum):
         param_k.data.mul_(momentum).add_(param_q.data * (1. - momentum))
 
 
+# def load_clips(udata, masks_enc, masks_pred, device, batch_size, num_clips):
+#     """Prepare clips and masks for training."""
+#     # Unsupervised video clips
+#     # Put each clip on the GPU and concatenate along batch dimension
+#     clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
+    
+#     # Put each mask-enc/mask-pred pair on the GPU and reuse the same mask pair for each clip
+#     masks_enc_loaded = []
+#     masks_pred_loaded = []
+#     for me, mp in zip(masks_enc, masks_pred):
+#         me = me.to(device, non_blocking=True)
+#         mp = mp.to(device, non_blocking=True)
+#         me = repeat_interleave_batch(me, batch_size, repeat=num_clips)
+#         mp = repeat_interleave_batch(mp, batch_size, repeat=num_clips)
+#         masks_enc_loaded.append(me)
+#         masks_pred_loaded.append(mp)
+#     return clips, masks_enc_loaded, masks_pred_loaded
+
+
 def train_one_epoch_custom(encoder, predictor, target_encoder, data_loader, optimizer, device, epoch, loss_scaler, args, log_writer=None):
-    """Custom training loop for one epoch."""
+    """Custom training loop for one epoch, incorporating the V-JEPA training logic."""
     encoder.train()
     predictor.train()
     
+    logger = get_logger(__name__)
+    
     # Initialize meters for tracking metrics
     loss_meter = AverageMeter()
+    input_var_meter = AverageMeter()
+    input_var_min_meter = AverageMeter()
     jepa_loss_meter = AverageMeter()
     reg_loss_meter = AverageMeter()
+    mask_meters = [AverageMeter() for _ in range(len(args.cfgs_mask))]
     gpu_time_meter = AverageMeter()
     wall_time_meter = AverageMeter()
     
-    # Extract loss configuration
+    # Extract necessary configurations
     cfgs_loss = args.model_args.get('loss', {})
     loss_exp = cfgs_loss.get('loss_exp', 2.0)
     reg_coeff = cfgs_loss.get('reg_coeff', 0.1)
+    mixed_precision = args.enable_amp
+    clip_grad = args.model_args.get('clip_grad', None)
+    warmup = args.warmup_epochs
+    dtype = torch.float16 if mixed_precision else torch.float32
     
-    # Iterate over data loader
-    for step, batch in enumerate(data_loader):
+    # Assume 'scheduler', 'wd_scheduler', and 'momentum_scheduler' are defined
+    # These should be initialized before and passed to this function if necessary
+    scheduler = args.scheduler  # Learning rate scheduler
+    wd_scheduler = args.wd_scheduler  # Weight decay scheduler
+    momentum_scheduler = args.momentum_scheduler  # Momentum scheduler
+    scaler = args.scaler  # For mixed precision training
+    
+    # Start training loop
+    for itr, (udata, masks_enc, masks_pred) in enumerate(data_loader):
         itr_start_time = time.time()
         
-        inputs, masks_enc, masks_pred = batch
+        try:
+            assert len(masks_enc) == len(masks_pred), 'Currently require num encoder masks = num predictor masks'
+            
+            batch_size = udata[0][0].size(0)  # Assuming udata[0] is a list of tensors
+            num_clips = len(udata[0])
+            
+            # Load clips and masks
+            clips, masks_enc_loaded, masks_pred_loaded = load_clips(udata, masks_enc, masks_pred, device, batch_size, num_clips)
+            
+            # Update mask meters
+            for idx, m in enumerate(mask_meters):
+                m.update(masks_enc_loaded[idx][0].size(-1))
+            
+            # Training step
+            (loss, loss_jepa, loss_reg, new_lr, new_wd, grad_stats, grad_stats_pred, optim_stats), gpu_etime_ms = gpu_timer(
+                train_step, encoder, predictor, target_encoder, clips, masks_enc_loaded, masks_pred_loaded,
+                optimizer, scaler, args, epoch, loss_exp, reg_coeff, mixed_precision, clip_grad, warmup,
+                scheduler, wd_scheduler, momentum_scheduler, dtype
+            )
+            
+            iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.
+            
+            # Update meters
+            loss_meter.update(loss)
+            jepa_loss_meter.update(loss_jepa)
+            reg_loss_meter.update(loss_reg)
+            gpu_time_meter.update(gpu_etime_ms)
+            wall_time_meter.update(iter_elapsed_time_ms)
+            
+            # Compute input variance
+            input_var = float(clips.view(clips.size(0), -1).var(dim=1).mean().item())
+            input_var_min = float(clips.view(clips.size(0), -1).var(dim=1).min().item())
+            input_var_meter.update(input_var)
+            input_var_min_meter.update(input_var_min)
+            
+            # Logging
+            if log_writer and itr % 10 == 0:
+                global_step = epoch * len(data_loader) + itr
+                log_writer.add_scalar("loss/train", loss, global_step)
+                log_writer.add_scalar("loss/jepa", loss_jepa, global_step)
+                log_writer.add_scalar("loss/reg", loss_reg, global_step)
+                log_writer.add_scalar("time/gpu_time_ms", gpu_etime_ms, global_step)
+                log_writer.add_scalar("time/wall_time_ms", iter_elapsed_time_ms, global_step)
+                log_writer.add_scalar("variance/input_var", input_var, global_step)
+                log_writer.add_scalar("variance/input_var_min", input_var_min, global_step)
         
-        inputs = inputs.to(device, non_blocking=True)
-        masks_enc = [mask.to(device, non_blocking=True) for mask in masks_enc]
-        masks_pred = [mask.to(device, non_blocking=True) for mask in masks_pred]
-        
-        # Forward pass with automatic mixed precision
-        with torch.cuda.amp.autocast(enabled=args.enable_amp):
-            # Encoder output
-            encoder_output = encoder(inputs, masks_enc)
-            # Target encoder output
-            with torch.no_grad():
-                target_output = target_encoder(inputs, masks_pred)
-            # Predictor output
-            predictor_output = predictor(encoder_output)
-            # Compute loss
-            loss = compute_loss(predictor_output, target_output)
-        
-        # Backward pass and optimization
-        optimizer.zero_grad()
-        loss_scaler(loss, optimizer, parameters=list(encoder.parameters()) + list(predictor.parameters()))
-        
-        # Update target encoder
-        update_target_encoder(encoder, target_encoder, args.model_args.get('momentum', 0.999))
-        
-        # Update meters
-        loss_meter.update(loss.item())
-        jepa_loss_meter.update(loss.item())  # Assuming loss_jepa is the same as loss
-        reg_loss_meter.update(0.0)  # Placeholder, update if regularization loss is computed
-        gpu_time = (time.time() - itr_start_time) * 1000  # in milliseconds
-        wall_time = (time.time() - itr_start_time) * 1000
-        gpu_time_meter.update(gpu_time)
-        wall_time_meter.update(wall_time)
-        
-        # Logging
-        if log_writer and step % 10 == 0:
-            global_step = epoch * len(data_loader) + step
-            log_writer.add_scalar("loss/train", loss.item(), global_step)
-            log_writer.add_scalar("loss/jepa", loss.item(), global_step)
-            log_writer.add_scalar("loss/reg", 0.0, global_step)
-            log_writer.add_scalar("time/gpu_time_ms", gpu_time, global_step)
-            log_writer.add_scalar("time/wall_time_ms", wall_time, global_step)
-    
-    # Log epoch metrics
-    if log_writer:
-        log_writer.add_scalar("epoch_loss/train", loss_meter.avg, epoch)
-        log_writer.add_scalar("epoch_loss/jepa", jepa_loss_meter.avg, epoch)
-        log_writer.add_scalar("epoch_loss/reg", reg_loss_meter.avg, epoch)
-        log_writer.add_scalar("epoch_time/gpu_time_ms", gpu_time_meter.avg, epoch)
-        log_writer.add_scalar("epoch_time/wall_time_ms", wall_time_meter.avg, epoch)
+        except Exception as e:
+            logger.info(f"Error during training iteration {itr}: {e}")
+            continue
     
     # Return metrics for potential further processing
     return {
@@ -361,6 +425,81 @@ def train_one_epoch_custom(encoder, predictor, target_encoder, data_loader, opti
         'gpu_time_ms': gpu_time_meter.avg,
         'wall_time_ms': wall_time_meter.avg,
     }
+
+
+def train_step(encoder, predictor, target_encoder, clips, masks_enc_loaded, masks_pred_loaded,
+               optimizer, scaler, args, epoch, loss_exp, reg_coeff, mixed_precision, clip_grad, warmup,
+               scheduler, wd_scheduler, momentum_scheduler, dtype):
+    """Perform a single training step."""
+    # Update learning rate and weight decay
+    new_lr = scheduler.step()
+    new_wd = wd_scheduler.step()
+    
+    # Forward pass for target encoder
+    def forward_target(c):
+        """Compute target representations."""
+        with torch.no_grad():
+            h = target_encoder(c)
+            h = F.layer_norm(h, (h.size(-1),))  # Normalize over feature dimension [B, N, D]
+            # Create targets (masked regions of h)
+            h_list = apply_masks(h, masks_pred_loaded, concat=False)
+            return h_list
+    
+    # Forward pass for context encoder and predictor
+    def forward_context(c, h_list):
+        """Compute context representations and predictions."""
+        z = encoder(c, masks_enc_loaded)
+        z = predictor(z, h_list, masks_enc_loaded, masks_pred_loaded)
+        return z
+    
+    # Compute losses
+    loss_jepa, loss_reg = 0.0, 0.0
+    with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+        h_list = forward_target(clips)
+        z_list = forward_context(clips, h_list)
+        loss_jepa = compute_loss(z_list, h_list, loss_exp, masks_pred_loaded)  # JEPA prediction loss
+        pstd_z = regularization_loss(z_list)  # Predictor variance across patches
+        loss_reg = torch.mean(F.relu(1.0 - pstd_z))
+    loss = loss_jepa + reg_coeff * loss_reg
+    
+    # Backward pass and optimization
+    enc_norm, pred_norm = 0.0, 0.0
+    optimizer.zero_grad()
+    if mixed_precision:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+    else:
+        loss.backward()
+    if (epoch > warmup) and (clip_grad is not None):
+        enc_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
+        pred_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
+    if mixed_precision:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    grad_stats = grad_logger(encoder.named_parameters())
+    grad_stats.global_norm = float(enc_norm)
+    grad_stats_pred = grad_logger(predictor.named_parameters())
+    grad_stats_pred.global_norm = float(pred_norm)
+    optimizer.zero_grad()
+    optim_stats = adamw_logger(optimizer)
+    
+    # Momentum update of target encoder
+    m = next(momentum_scheduler)
+    with torch.no_grad():
+        update_target_encoder(encoder, target_encoder, m)
+    
+    return (
+        float(loss.item()),
+        float(loss_jepa.item()),
+        float(loss_reg.item()),
+        new_lr,
+        new_wd,
+        grad_stats,
+        grad_stats_pred,
+        optim_stats,
+    )
 
 
 def save_checkpoint(epoch, path, encoder, predictor, optimizer, loss_scaler, target_encoder, args):
@@ -414,7 +553,7 @@ def main(args, additional_args):
             setattr(args, key, value)
     
     # Extract mask configuration
-    cfgs_mask = merged_config.get('mask', [])
+    args.cfgs_mask = merged_config.get('mask', [])
     
     # Initialize data loader
     data_loader_train, sampler_train = initialize_data_loader(args)
@@ -423,7 +562,13 @@ def main(args, additional_args):
     log_writer = initialize_logging(args)
     
     # Initialize model, optimizer, and scaler
-    model, model_without_ddp, encoder, predictor, target_encoder, optimizer, loss_scaler = initialize_model(args, device, cfgs_mask)
+    model, model_without_ddp, encoder, predictor, target_encoder, optimizer, loss_scaler = initialize_model(args, device, args.cfgs_mask)
+    
+    # Initialize scalers and schedulers (assuming they are defined in args or elsewhere)
+    args.scaler = loss_scaler
+    args.scheduler = ...  # Define your learning rate scheduler
+    args.wd_scheduler = ...  # Define your weight decay scheduler
+    args.momentum_scheduler = ...  # Define your momentum scheduler
     
     # Load checkpoint if resume path is provided
     if args.resume:
@@ -437,10 +582,14 @@ def main(args, additional_args):
             target_encoder.load_state_dict(checkpoint['target_encoder'])
         print(f"Resumed training from checkpoint {args.resume} at epoch {checkpoint['epoch']}")
     
+    logger = get_logger(__name__)
+    
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     
     for epoch in range(args.start_epoch, args.epochs):
+        logger.info('Epoch %d' % (epoch + 1))
+        
         if args.distributed:
             sampler_train.set_epoch(epoch)
         
@@ -454,7 +603,7 @@ def main(args, additional_args):
         
         # Save checkpoints
         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
-            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pth")
+            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pth.tar")
             save_checkpoint(epoch, checkpoint_path, encoder, predictor, optimizer, loss_scaler, target_encoder, args)
         
         # Log training stats
@@ -493,9 +642,10 @@ if __name__ == '__main__':
     # Load additional configuration file
     if additional_args.fname:
         additional_config = load_yaml_config(additional_args.fname)
+        # additional_args = merge_configs(additional_args, additional_config)
         # Depending on how you want to handle additional_config, it can be merged later
         # In this case, merging is handled in the main function
-    
+
     # Parse again to include config file defaults
     main_args = main_parser.parse_args()
     
