@@ -33,7 +33,11 @@ import timm.optim.optim_factory as optim_factory
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from engine_pretrain import train_one_epoch
-from util import load_checkpoint, init_video_model, init_opt
+from vjepa.utils import (
+    load_checkpoint,
+    init_video_model,
+    init_opt,
+)
 from src.utils.logging import (
     CSVLogger,
     gpu_timer,
@@ -153,7 +157,8 @@ def merge_configs(main_config, additional_config):
     merged = copy.deepcopy(main_config)
     for key, value in additional_config.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key].update(value)
+            # merged[key].update(value)
+            continue
         else:
             merged[key] = value
     return merged
