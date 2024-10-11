@@ -21,9 +21,12 @@ from pathlib import Path
 import random
 import copy
 
+from src.utils.tensors import repeat_interleave_batch
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
+
 import timm
 import timm.optim.optim_factory as optim_factory
 
@@ -31,6 +34,14 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from engine_pretrain import train_one_epoch
 from util import load_checkpoint, init_video_model, init_opt
+from src.utils.logging import (
+    CSVLogger,
+    gpu_timer,
+    get_logger,
+    grad_logger,
+    adamw_logger,
+    AverageMeter
+)
 
 
 def import_class(name):
@@ -165,7 +176,7 @@ def initialize_model(args, device, cfgs_mask):
     
     # If using DistributedDataParallel
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
         model_without_ddp = model.module
     else:
         model_without_ddp = model
@@ -270,17 +281,38 @@ def train_one_epoch_custom(encoder, predictor, target_encoder, data_loader, opti
     encoder.train()
     predictor.train()
     
+    # Initialize meters for tracking metrics
+    loss_meter = AverageMeter()
+    jepa_loss_meter = AverageMeter()
+    reg_loss_meter = AverageMeter()
+    gpu_time_meter = AverageMeter()
+    wall_time_meter = AverageMeter()
+    
+    # Extract loss configuration
+    cfgs_loss = args.model_args.get('loss', {})
+    loss_exp = cfgs_loss.get('loss_exp', 2.0)
+    reg_coeff = cfgs_loss.get('reg_coeff', 0.1)
+    
+    # Iterate over data loader
     for step, batch in enumerate(data_loader):
-        inputs, masks = batch
+        itr_start_time = time.time()
+        
+        inputs, masks_enc, masks_pred = batch
+        
         inputs = inputs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+        masks_enc = [mask.to(device, non_blocking=True) for mask in masks_enc]
+        masks_pred = [mask.to(device, non_blocking=True) for mask in masks_pred]
         
         # Forward pass with automatic mixed precision
         with torch.cuda.amp.autocast(enabled=args.enable_amp):
-            encoder_output = encoder(inputs, masks)
+            # Encoder output
+            encoder_output = encoder(inputs, masks_enc)
+            # Target encoder output
             with torch.no_grad():
-                target_output = target_encoder(inputs, masks)
+                target_output = target_encoder(inputs, masks_pred)
+            # Predictor output
             predictor_output = predictor(encoder_output)
+            # Compute loss
             loss = compute_loss(predictor_output, target_output)
         
         # Backward pass and optimization
@@ -290,10 +322,58 @@ def train_one_epoch_custom(encoder, predictor, target_encoder, data_loader, opti
         # Update target encoder
         update_target_encoder(encoder, target_encoder, args.model_args.get('momentum', 0.999))
         
+        # Update meters
+        loss_meter.update(loss.item())
+        jepa_loss_meter.update(loss.item())  # Assuming loss_jepa is the same as loss
+        reg_loss_meter.update(0.0)  # Placeholder, update if regularization loss is computed
+        gpu_time = (time.time() - itr_start_time) * 1000  # in milliseconds
+        wall_time = (time.time() - itr_start_time) * 1000
+        gpu_time_meter.update(gpu_time)
+        wall_time_meter.update(wall_time)
+        
         # Logging
         if log_writer and step % 10 == 0:
             global_step = epoch * len(data_loader) + step
             log_writer.add_scalar("loss/train", loss.item(), global_step)
+            log_writer.add_scalar("loss/jepa", loss.item(), global_step)
+            log_writer.add_scalar("loss/reg", 0.0, global_step)
+            log_writer.add_scalar("time/gpu_time_ms", gpu_time, global_step)
+            log_writer.add_scalar("time/wall_time_ms", wall_time, global_step)
+    
+    # Log epoch metrics
+    if log_writer:
+        log_writer.add_scalar("epoch_loss/train", loss_meter.avg, epoch)
+        log_writer.add_scalar("epoch_loss/jepa", jepa_loss_meter.avg, epoch)
+        log_writer.add_scalar("epoch_loss/reg", reg_loss_meter.avg, epoch)
+        log_writer.add_scalar("epoch_time/gpu_time_ms", gpu_time_meter.avg, epoch)
+        log_writer.add_scalar("epoch_time/wall_time_ms", wall_time_meter.avg, epoch)
+    
+    # Return metrics for potential further processing
+    return {
+        'train_loss': loss_meter.avg,
+        'train_jepa_loss': jepa_loss_meter.avg,
+        'train_reg_loss': reg_loss_meter.avg,
+        'gpu_time_ms': gpu_time_meter.avg,
+        'wall_time_ms': wall_time_meter.avg,
+    }
+
+
+def save_checkpoint(epoch, path, encoder, predictor, optimizer, loss_scaler, target_encoder, args):
+    """Save the training checkpoint."""
+    save_dict = {
+        'encoder': encoder.state_dict(),
+        'predictor': predictor.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'loss_scaler': loss_scaler.state_dict(),
+        'target_encoder': target_encoder.state_dict(),
+        'epoch': epoch,
+        'args': vars(args),
+    }
+    try:
+        torch.save(save_dict, path)
+        print(f"Checkpoint saved at {path}")
+    except Exception as e:
+        print(f"Failed to save checkpoint at {path}: {e}")
 
 
 def main(args, additional_args):
@@ -342,7 +422,15 @@ def main(args, additional_args):
     
     # Load checkpoint if resume path is provided
     if args.resume:
-        misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+        checkpoint = load_checkpoint(args.resume)
+        model_without_ddp.load_state_dict(checkpoint['encoder'], strict=False)
+        predictor.load_state_dict(checkpoint['predictor'], strict=False)
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'loss_scaler' in checkpoint and checkpoint['loss_scaler'] is not None:
+            loss_scaler.load_state_dict(checkpoint['loss_scaler'])
+        if 'target_encoder' in checkpoint:
+            target_encoder.load_state_dict(checkpoint['target_encoder'])
+        print(f"Resumed training from checkpoint {args.resume} at epoch {checkpoint['epoch']}")
     
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -352,7 +440,7 @@ def main(args, additional_args):
             sampler_train.set_epoch(epoch)
         
         # Train for one epoch
-        train_one_epoch_custom(
+        train_stats = train_one_epoch_custom(
             encoder, predictor, target_encoder,
             data_loader_train, optimizer, device,
             epoch, loss_scaler, args,
@@ -361,16 +449,12 @@ def main(args, additional_args):
         
         # Save checkpoints
         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp,
-                optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch
-            )
+            checkpoint_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pth")
+            save_checkpoint(epoch, checkpoint_path, encoder, predictor, optimizer, loss_scaler, target_encoder, args)
         
         # Log training stats
-        log_stats = {
-            'epoch': epoch,
-            # Add other stats here as needed
-        }
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     'epoch': epoch}
         
         if args.output_dir and misc.is_main_process():
             if log_writer:
