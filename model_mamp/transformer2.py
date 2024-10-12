@@ -418,6 +418,8 @@ class Transformer(nn.Module):
         def __init__(self, transformer):
             super().__init__()
             self.encoder = copy.deepcopy(transformer)
+            self.decoder = copy.deepcopy(transformer)
+            self.forward_loss = copy.deepcopy(transformer.forward_loss)
             for param in self.encoder.parameters():
                 param.requires_grad = True
         def forward(self, x, mask_ratio, motion_stride=1, motion_aware_tau=0.75):
@@ -431,7 +433,7 @@ class Transformer(nn.Module):
 
     # Forward loss using L1 loss and EMA updating
     def forward_loss(student, teacher, imgs, pred, mask, teacher_latent, ids_restore, ema_decay=0.999):
-        target = student.encoder.patchify(imgs)
+        target = teacher.encoder.patchify(imgs)
         if student.encoder.norm_skes_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
@@ -478,20 +480,36 @@ class Transformer(nn.Module):
         x_motion[:, -motion_stride:, :, :] = 0
         return x_motion
 
+    # def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
+    #     N, C, T, V, M = x.shape
+
+    #     x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+
+    #     x_motion = self.extract_motion(x, motion_stride)
+    #     print('x_motion.shape', x_motion.shape)
+    #     latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
+    #     print('latent.shape', latent.shape)
+    #     print('mask.shape', mask.shape)
+    #     print ('ids_restore2.shape', ids_restore.shape)
+    #     pred = self.forward_decoder(latent, ids_restore)  # [NM, TP * VP, C]
+    #     print('pred.shape', pred.shape)
+    #     loss = self.forward_loss(x_motion, pred, mask)
+        
+    #     return loss, pred, mask
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
         N, C, T, V, M = x.shape
 
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
 
         x_motion = self.extract_motion(x, motion_stride)
-        print('x_motion.shape', x_motion.shape)
-        latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
-        print('latent.shape', latent.shape)
-        print('mask.shape', mask.shape)
-        print ('ids_restore2.shape', ids_restore.shape)
-        pred = self.forward_decoder(latent, ids_restore)  # [NM, TP * VP, C]
-        print('pred.shape', pred.shape)
-        loss = self.forward_loss(x_motion, pred, mask)
+        teacher = self.Teacher(self)
+        teacher_latent, mask, ids_restore = teacher(x, motion_aware_tau, mask_ratio==0.0)
+        student = self.Student(self)
+        loss, pred, mask = student(x, mask_ratio, motion_stride, motion_aware_tau)
+        # return loss, pred, mask
+        # latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
+        # pred = self.forward_decoder(latent, ids_restore)
+        # loss = self.forward_loss(x_motion, pred, mask, latent, ids_restore)
         
         return loss, pred, mask
 
