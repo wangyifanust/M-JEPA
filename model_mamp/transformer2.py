@@ -350,35 +350,55 @@ class Transformer(nn.Module):
 
         return x_masked, mask, ids_restore, ids_keep
     
-    # def forward_encoder(self, x, mask_ratio, motion_aware_tau):
-    #     x_orig = self.patchify(x)
-    #     x = self.joints_embed(x)
-    #     NM, TP, VP, _ = x.shape
-    #     x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
-    #     x = x.reshape(NM, TP * VP, -1)
-    #     x, mask, ids_restore, _ = self.random_masking(x, mask_ratio) if motion_aware_tau <= 0 else self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
-    #     for blk in self.blocks:
-    #         x = blk(x)
-    #     x = self.norm(x)
-    #     return x, mask, ids_restore
+    def forward_encoder(self, x, mask_ratio, motion_aware_tau):
+        x_orig = self.patchify(x)
 
-    # def forward_decoder(self, x, ids_restore):
-    #     NM = x.shape[0]
-    #     TP = self.joints_embed.t_grid_size
-    #     VP = self.joints_embed.grid_size
-    #     x = self.decoder_embed(x)
-    #     C = x.shape[-1]
-    #     mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
-    #     x_ = torch.cat([x, mask_tokens], dim=1)
-    #     x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))
-    #     x = x_.view([NM, TP, VP, C])
-    #     x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
-    #     x = x.reshape(NM, TP * VP, C)
-    #     for blk in self.decoder_blocks:
-    #         x = blk(x)
-    #     x = self.decoder_norm(x)
-    #     x = self.decoder_pred(x)
-    #     return x
+        # embed skeletons
+        x = self.joints_embed(x)
+
+        NM, TP, VP, _ = x.shape
+
+        # add pos & temp embed
+        x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+
+        # masking: length -> length * mask_ratio
+        x = x.reshape(NM, TP * VP, -1)
+        print('x.shape', x.shape)
+        if motion_aware_tau > 0:
+            x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
+            print('x_orig.shape', x_orig.shape)
+            x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+        else:   
+            x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+        print('x.shape', x.shape)
+        print('mask.shape', mask.shape)
+        print('ids_restore.shape', ids_restore.shape)
+
+        # apply Transformer blocks
+        for idx, blk in enumerate(self.blocks):
+            x = blk(x)
+
+        x = self.norm(x)
+
+        return x, mask, ids_restore
+
+    def forward_decoder(self, x, ids_restore):
+        NM = x.shape[0]
+        TP = self.joints_embed.t_grid_size
+        VP = self.joints_embed.grid_size
+        x = self.decoder_embed(x)
+        C = x.shape[-1]
+        mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
+        x_ = torch.cat([x, mask_tokens], dim=1)
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))
+        x = x_.view([NM, TP, VP, C])
+        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
+        x = x.reshape(NM, TP * VP, C)
+        for blk in self.decoder_blocks:
+            x = blk(x)
+        x = self.decoder_norm(x)
+        x = self.decoder_pred(x)
+        return x
 
     # Teacher sub-class
     class Teacher(nn.Module):
@@ -391,60 +411,88 @@ class Transformer(nn.Module):
         # def forward(self, x, mask_ratio, motion_aware_tau):
         #     with torch.no_grad():
         #         return self.encoder.forward_encoder(x, mask_ratio, motion_aware_tau)
-        def forward_encoder(self, x, motion_aware_tau):
-            x_orig = self.patchify(x)
-            x = self.joints_embed(x)
-            NM, TP, VP, _ = x.shape
-            x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
-            x = x.reshape(NM, TP * VP, -1)
-            # x, mask, ids_restore, _ = self.random_masking(x, 0.8)
-            for blk in self.blocks:
-                x = blk(x)
-            x = self.norm(x)
-            return x
+        # def forward_encoder(self, x, motion_aware_tau):
+        #     x_orig = self.patchify(x)
+        #     x = self.joints_embed(x)
+        #     NM, TP, VP, _ = x.shape
+        #     x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+        #     x = x.reshape(NM, TP * VP, -1)
+        #     # x, mask, ids_restore, _ = self.random_masking(x, 0.8)
+        #     for blk in self.blocks:
+        #         x = blk(x)
+        #     x = self.norm(x)
+        #     return x
+        def forward(self, x, motion_aware_tau,mask_ratio=0.0):
+            with torch.no_grad():
+                return self.encoder.forward_encoder(x, mask_ratio, motion_aware_tau)
+        # def forward_encoder(self, x, motion_aware_tau,mask_ratio=0.0):
+        #     x_orig = self.patchify(x)
+        #     x = self.joints_embed(x)
+        #     NM, TP, VP, _ = x.shape
+        #     x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+        #     x = x.reshape(NM, TP * VP, -1)
+        #     if motion_aware_tau > 0:
+        #         x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
+        #         x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+        #     else:
+        #         x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+        #     for blk in self.blocks:
+        #         x = blk(x)
+        #     x = self.norm(x)
+        #     return x, mask, ids_restore
 
     # Student sub-class
     class Student(nn.Module):
         def __init__(self, transformer):
             super().__init__()
             self.encoder = copy.deepcopy(transformer)
+            for param in self.encoder.parameters():
+                param.requires_grad = True
+        def forward(self, x, mask_ratio, motion_stride=1, motion_aware_tau=0.75):
+            N, C, T, V, M = x.shape
+            x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+            x_motion = self.extract_motion(x, motion_stride)
+            latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
+            pred = self.forward_decoder(latent, ids_restore)
+            loss = self.forward_loss(x_motion, pred, mask)
+            return loss, pred, mask
 
-        def forward_encoder(self, x, mask_ratio, motion_aware_tau):
-            x_orig = self.patchify(x)
+        # def forward_encoder(self, x, mask_ratio, motion_aware_tau):
+        #     x_orig = self.patchify(x)
 
-            # embed skeletons
-            x = self.joints_embed(x)
+        #     # embed skeletons
+        #     x = self.joints_embed(x)
 
-            NM, TP, VP, _ = x.shape
+        #     NM, TP, VP, _ = x.shape
 
-            # add pos & temp embed
-            x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+        #     # add pos & temp embed
+        #     x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
 
-            # masking: length -> length * mask_ratio
-            x = x.reshape(NM, TP * VP, -1)
-            print('x.shape', x.shape)
-            if motion_aware_tau > 0:
-                x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
-                print('x_orig.shape', x_orig.shape)
-                x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
-            else:   
-                x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
-            print('x.shape', x.shape)
-            print('mask.shape', mask.shape)
-            print('ids_restore.shape', ids_restore.shape)
+        #     # masking: length -> length * mask_ratio
+        #     x = x.reshape(NM, TP * VP, -1)
+        #     print('x.shape', x.shape)
+        #     if motion_aware_tau > 0:
+        #         x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
+        #         print('x_orig.shape', x_orig.shape)
+        #         x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+        #     else:   
+        #         x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+        #     print('x.shape', x.shape)
+        #     print('mask.shape', mask.shape)
+        #     print('ids_restore.shape', ids_restore.shape)
 
-            # apply Transformer blocks
-            for idx, blk in enumerate(self.blocks):
-                x = blk(x)
+        #     # apply Transformer blocks
+        #     for idx, blk in enumerate(self.blocks):
+        #         x = blk(x)
 
-            x = self.norm(x)
+        #     x = self.norm(x)
     
-            return x, mask, ids_restore
+        #     return x, mask, ids_restore
 
     # Forward loss using L1 loss and EMA updating
-    def forward_loss2(self, imgs, pred, mask, teacher_latent, ids_restore, ema_decay=0.999):
-        target = self.patchify(imgs)
-        if self.norm_skes_loss:
+    def forward_loss(student, teacher, imgs, pred, mask, teacher_latent, ids_restore, ema_decay=0.999):
+        target = student.encoder.patchify(imgs)
+        if student.encoder.norm_skes_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.0e-6) ** 0.5
@@ -456,13 +504,13 @@ class Transformer(nn.Module):
 
         # EMA update for teacher encoder
         with torch.no_grad():
-            student_params = dict(self.Student(self).encoder.named_parameters())
-            teacher_params = dict(self.Teacher(self).encoder.named_parameters())
+            student_params = dict(student.encoder.named_parameters())
+            teacher_params = dict(teacher.encoder.named_parameters())
             for name in student_params:
                 if name in teacher_params:
                     teacher_params[name].data.mul_(ema_decay).add_(student_params[name].data * (1 - ema_decay))
-
         return total_loss
+    
     def patchify(self, imgs):
         """
         imgs: (N, T, V, 3)
