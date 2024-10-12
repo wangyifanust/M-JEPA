@@ -410,7 +410,7 @@ class Transformer(nn.Module):
 
         def forward(self, x, motion_aware_tau,mask_ratio=0.0):
             with torch.no_grad():
-                return self.encoder.forward_encoder(x, mask_ratio, motion_aware_tau)
+                return self.encoder.forward_encoder(x, motion_aware_tau,mask_ratio=0.0)
 
 
     # Student sub-class
@@ -422,26 +422,25 @@ class Transformer(nn.Module):
             self.forward_loss = copy.deepcopy(transformer.forward_loss)
             for param in self.encoder.parameters():
                 param.requires_grad = True
-        def forward(self, x, mask_ratio, motion_stride=1, motion_aware_tau=0.75):
-            N, C, T, V, M = x.shape
-            x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
-            x_motion = self.extract_motion(x, motion_stride)
-            latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
-            pred = self.forward_decoder(latent, ids_restore)
-            loss = self.forward_loss(x_motion, pred, mask)
-            return loss, pred, mask
+        def forward(self, x, mask_ratio, motion_aware_tau=0.75):
+            # N, C, T, V, M = x.shape
+            # x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+            # x_motion = self.extract_motion(x, motion_stride)
+            latent, mask, ids_restore = self.encoder.forward_encoder(x, mask_ratio, motion_aware_tau)
+            pred = self.encoder.forward_decoder(latent, ids_restore)
+            return latent, pred, mask
 
     # Forward loss using L1 loss and EMA updating
-    def forward_loss(student, teacher, imgs, pred, mask, teacher_latent, ids_restore, ema_decay=0.999):
-        target = teacher.encoder.patchify(imgs)
-        if student.encoder.norm_skes_loss:
-            mean = target.mean(dim=-1, keepdim=True)
-            var = target.var(dim=-1, keepdim=True)
-            target = (target - mean) / (var + 1.0e-6) ** 0.5
+    def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, student, teacher, ema_decay=0.999):
+        # target = teacher.encoder.patchify(imgs)
+        # if student.encoder.norm_skes_loss:
+        #     mean = target.mean(dim=-1, keepdim=True)
+        #     var = target.var(dim=-1, keepdim=True)
+        #     target = (target - mean) / (var + 1.0e-6) ** 0.5
         
-        recon_loss = F.l1_loss(pred, target, reduction='none')
+        recon_loss = F.l1_loss(student_latent, teacher_latent, reduction='none')
         recon_loss = (recon_loss.mean(dim=-1) * mask).sum() / mask.sum()
-        contrastive_loss = F.mse_loss(teacher_latent, pred, reduction='mean')
+        contrastive_loss = F.mse_loss(teacher_latent, target, reduction='none')
         total_loss = recon_loss + contrastive_loss
 
         # EMA update for teacher encoder
@@ -498,18 +497,16 @@ class Transformer(nn.Module):
     #     return loss, pred, mask
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
         N, C, T, V, M = x.shape
-
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
-
         x_motion = self.extract_motion(x, motion_stride)
+
         teacher = self.Teacher(self)
-        teacher_latent, mask, ids_restore = teacher(x, motion_aware_tau, mask_ratio==0.0)
+        teacher_latent, mask, ids_restore = teacher(x, motion_aware_tau, mask_ratio)
+
         student = self.Student(self)
-        loss, pred, mask = student(x, mask_ratio, motion_stride, motion_aware_tau)
-        # return loss, pred, mask
-        # latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
-        # pred = self.forward_decoder(latent, ids_restore)
-        # loss = self.forward_loss(x_motion, pred, mask, latent, ids_restore)
+        student_latent, pred, mask = student(x, mask_ratio, motion_stride, motion_aware_tau)
+
+        loss = self.forward_loss(student_latent, teacher_latent, x_motion, mask, ids_restore, student, teacher)
         
         return loss, pred, mask
 
