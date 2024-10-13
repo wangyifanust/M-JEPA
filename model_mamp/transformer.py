@@ -363,16 +363,16 @@ class Transformer(nn.Module):
 
         # masking: length -> length * mask_ratio
         x = x.reshape(NM, TP * VP, -1)
-        print('x.shape', x.shape)
+        # print('x.shape', x.shape)
         if motion_aware_tau > 0:
             x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
-            print('x_orig.shape', x_orig.shape)
+            # print('x_orig.shape', x_orig.shape)
             x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
         else:   
             x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
-        print('x.shape', x.shape)
-        print('mask.shape', mask.shape)
-        print('ids_restore.shape', ids_restore.shape)
+        # print('x.shape', x.shape)
+        # print('mask.shape', mask.shape)
+        # print('ids_restore.shape', ids_restore.shape)
 
         # apply Transformer blocks
         for idx, blk in enumerate(self.blocks):
@@ -387,17 +387,24 @@ class Transformer(nn.Module):
         TP = self.joints_embed.t_grid_size
         VP = self.joints_embed.grid_size
         x = self.decoder_embed(x)
+        # print('x.shape', x.shape)
         C = x.shape[-1]
         mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
         x_ = torch.cat([x, mask_tokens], dim=1)
+        # print('x_.shape', x_.shape)
+
         x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))
         x = x_.view([NM, TP, VP, C])
+        # print('x.shape', x.shape)
         x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
         x = x.reshape(NM, TP * VP, C)
+        # print ('x.shape', x.shape)
         for blk in self.decoder_blocks:
             x = blk(x)
         x = self.decoder_norm(x)
-        x = self.decoder_pred(x)
+        # print('xbeforepred.shape', x.shape)
+        # x = self.decoder_pred(x)
+        # print('xafterpred.shape', x.shape)
         return x
 
     # Teacher sub-class
@@ -408,9 +415,10 @@ class Transformer(nn.Module):
             for param in self.encoder.parameters():
                 param.requires_grad = False
 
-        def forward(self, x, motion_aware_tau,mask_ratio=0.0):
+        def forward(self, x, motion_aware_tau=0.0, mask_ratio=0.0):
+            mask_ratio = 0.0
             with torch.no_grad():
-                return self.encoder.forward_encoder(x, motion_aware_tau,mask_ratio=0.0)
+                return self.encoder.forward_encoder(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
 
 
     # Student sub-class
@@ -421,7 +429,7 @@ class Transformer(nn.Module):
             # self.decoder = copy.deepcopy(transformer)
             # self.forward_loss = copy.deepcopy(transformer.forward_loss)
             self.transformer = transformer
-            for param in self.encoder.parameters():
+            for param in self.transformer.parameters():
                 param.requires_grad = True
         def forward(self, x, mask_ratio, motion_aware_tau=0.75):
             # N, C, T, V, M = x.shape
@@ -429,7 +437,7 @@ class Transformer(nn.Module):
             # x_motion = self.extract_motion(x, motion_stride)
             latent, mask, ids_restore = self.transformer.forward_encoder(x, mask_ratio, motion_aware_tau)
             pred = self.transformer.forward_decoder(latent, ids_restore)
-            return latent, pred, mask
+            return pred, mask, ids_restore
 
     # Forward loss using L1 loss and EMA updating
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, student, teacher, ema_decay=0.999):
@@ -441,17 +449,17 @@ class Transformer(nn.Module):
         
         recon_loss = F.l1_loss(student_latent, teacher_latent, reduction='none')
         recon_loss = (recon_loss.mean(dim=-1) * mask).sum() / mask.sum()
-        contrastive_loss = F.mse_loss(teacher_latent, target, reduction='none')
-        total_loss = recon_loss + contrastive_loss
+        # contrastive_loss = F.mse_loss(teacher_latent, target, reduction='none')
+        # total_loss = recon_loss + contrastive_loss
 
         # EMA update for teacher encoder
         with torch.no_grad():
-            student_params = dict(student.encoder.named_parameters())
+            student_params = dict(student.transformer.named_parameters())
             teacher_params = dict(teacher.encoder.named_parameters())
             for name in student_params:
                 if name in teacher_params:
                     teacher_params[name].data.mul_(ema_decay).add_(student_params[name].data * (1 - ema_decay))
-        return total_loss
+        return recon_loss
     
     def patchify(self, imgs):
         """
@@ -503,9 +511,16 @@ class Transformer(nn.Module):
 
         teacher = self.Teacher(self)
         teacher_latent, mask, ids_restore = teacher(x, motion_aware_tau, mask_ratio)
+        # print('teacher_latent.shape', teacher_latent.shape)
+        # print('mask1.shape', mask.shape)
+        # print('ids_restore1.shape', ids_restore.shape)
 
         student = self.Student(self)
-        student_latent, pred, mask = student(x, mask_ratio, motion_stride, motion_aware_tau)
+        pred, mask, ids_restore2= student(x, mask_ratio, motion_aware_tau)
+        student_latent = pred
+        # print('student_latent.shape', student_latent.shape)
+        # print('pred.shape', pred.shape)
+        # print('mask2.shape', mask.shape)
 
         loss = self.forward_loss(student_latent, teacher_latent, x_motion, mask, ids_restore, student, teacher)
         
