@@ -4,8 +4,17 @@ import torch.nn.functional as F
 import math
 import warnings
 from .drop import DropPath
-
-
+from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
+import src.models.vision_transformer as video_vit
+import src.models.predictor as vit_pred
+import logging
+from src.utils.logging import (
+    CSVLogger,
+    gpu_timer,
+    get_logger,
+    grad_logger,
+    adamw_logger,
+    AverageMeter)
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
     # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
@@ -197,11 +206,6 @@ class SkeleEmbed(nn.Module):
         x = torch.einsum("ncts->ntsc", x)  # [N, T, V, C]
         return x
 
-import copy
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-
 class Transformer(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
@@ -349,7 +353,7 @@ class Transformer(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_masked, mask, ids_restore, ids_keep
-    
+
     def forward_encoder(self, x, mask_ratio, motion_aware_tau):
         x_orig = self.patchify(x)
 
@@ -363,95 +367,54 @@ class Transformer(nn.Module):
 
         # masking: length -> length * mask_ratio
         x = x.reshape(NM, TP * VP, -1)
-        print('x.shape', x.shape)
+        
         if motion_aware_tau > 0:
             x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
-            print('x_orig.shape', x_orig.shape)
             x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
         else:   
             x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
-        print('x.shape', x.shape)
-        print('mask.shape', mask.shape)
-        print('ids_restore.shape', ids_restore.shape)
 
         # apply Transformer blocks
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
 
         x = self.norm(x)
-
+ 
         return x, mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
         NM = x.shape[0]
         TP = self.joints_embed.t_grid_size
         VP = self.joints_embed.grid_size
+
+        # embed tokens
         x = self.decoder_embed(x)
         C = x.shape[-1]
+
+        # append intra mask tokens to sequence
         mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
-        x_ = torch.cat([x, mask_tokens], dim=1)
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))
+        x_ = torch.cat([x[:, :, :], mask_tokens], dim=1)  # no cls token
+        x_ = torch.gather(
+            x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2])
+        )  # unshuffle
         x = x_.view([NM, TP, VP, C])
-        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
+
+        # add pos & temp embed
+        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]  # NM, TP, VP, C
+        
+        # apply Transformer blocks
         x = x.reshape(NM, TP * VP, C)
-        for blk in self.decoder_blocks:
+
+        for idx, blk in enumerate(self.decoder_blocks):
             x = blk(x)
+        
         x = self.decoder_norm(x)
+        
+        # predictor projection
         x = self.decoder_pred(x)
+
         return x
 
-    # Teacher sub-class
-    class Teacher(nn.Module):
-        def __init__(self, student_encoder):
-            super().__init__()
-            self.encoder = copy.deepcopy(student_encoder)
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-
-        def forward(self, x, motion_aware_tau,mask_ratio=0.0):
-            with torch.no_grad():
-                return self.encoder.forward_encoder(x, motion_aware_tau,mask_ratio=0.0)
-
-
-    # Student sub-class
-    class Student(nn.Module):
-        def __init__(self, transformer):
-            super().__init__()
-            self.encoder = copy.deepcopy(transformer)
-            self.decoder = copy.deepcopy(transformer)
-            self.forward_loss = copy.deepcopy(transformer.forward_loss)
-            for param in self.encoder.parameters():
-                param.requires_grad = True
-        def forward(self, x, mask_ratio, motion_aware_tau=0.75):
-            # N, C, T, V, M = x.shape
-            # x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
-            # x_motion = self.extract_motion(x, motion_stride)
-            latent, mask, ids_restore = self.encoder.forward_encoder(x, mask_ratio, motion_aware_tau)
-            pred = self.encoder.forward_decoder(latent, ids_restore)
-            return latent, pred, mask
-
-    # Forward loss using L1 loss and EMA updating
-    def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, student, teacher, ema_decay=0.999):
-        # target = teacher.encoder.patchify(imgs)
-        # if student.encoder.norm_skes_loss:
-        #     mean = target.mean(dim=-1, keepdim=True)
-        #     var = target.var(dim=-1, keepdim=True)
-        #     target = (target - mean) / (var + 1.0e-6) ** 0.5
-        
-        recon_loss = F.l1_loss(student_latent, teacher_latent, reduction='none')
-        recon_loss = (recon_loss.mean(dim=-1) * mask).sum() / mask.sum()
-        contrastive_loss = F.mse_loss(teacher_latent, target, reduction='none')
-        total_loss = recon_loss + contrastive_loss
-
-        # EMA update for teacher encoder
-        with torch.no_grad():
-            student_params = dict(student.encoder.named_parameters())
-            teacher_params = dict(teacher.encoder.named_parameters())
-            for name in student_params:
-                if name in teacher_params:
-                    teacher_params[name].data.mul_(ema_decay).add_(student_params[name].data * (1 - ema_decay))
-        return total_loss
-    
     def patchify(self, imgs):
         """
         imgs: (N, T, V, 3)
@@ -479,35 +442,109 @@ class Transformer(nn.Module):
         x_motion[:, -motion_stride:, :, :] = 0
         return x_motion
 
-    # def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
-    #     N, C, T, V, M = x.shape
 
-    #     x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+    def forward_loss(self, imgs, pred, mask):
+        """
+        imgs: [NM, T, V, 3]
+        pred: [NM, TP * VP, t_patch_size * patch_size * 3]
+        mask: [NM, TP * VP], 0 is keep, 1 is remove,
+        """
+        target = self.patchify(imgs)  # [NM, TP * VP, C]
 
-    #     x_motion = self.extract_motion(x, motion_stride)
-    #     print('x_motion.shape', x_motion.shape)
-    #     latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
-    #     print('latent.shape', latent.shape)
-    #     print('mask.shape', mask.shape)
-    #     print ('ids_restore2.shape', ids_restore.shape)
-    #     pred = self.forward_decoder(latent, ids_restore)  # [NM, TP * VP, C]
-    #     print('pred.shape', pred.shape)
-    #     loss = self.forward_loss(x_motion, pred, mask)
+        if self.norm_skes_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.0e-6) ** 0.5
+
+        loss = (pred - target) ** 2
+        loss = loss.mean(dim=-1)  # [NM, TP * VP], mean loss per patch
         
-    #     return loss, pred, mask
+        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed joints
+
+        return loss
+
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
         N, C, T, V, M = x.shape
+
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+
         x_motion = self.extract_motion(x, motion_stride)
 
-        teacher = self.Teacher(self)
-        teacher_latent, mask, ids_restore = teacher(x, motion_aware_tau, mask_ratio)
+        latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
+        pred = self.forward_decoder(latent, ids_restore)  # [NM, TP * VP, C]
 
-        student = self.Student(self)
-        student_latent, pred, mask = student(x, mask_ratio, motion_stride, motion_aware_tau)
-
-        loss = self.forward_loss(student_latent, teacher_latent, x_motion, mask, ids_restore, student, teacher)
+        loss = self.forward_loss(x_motion, pred, mask)
         
         return loss, pred, mask
+    def init_video_model(
+        device,
+        patch_size=16,
+        num_frames=16,
+        tubelet_size=2,
+        model_name='vit_base',
+        crop_size=224,
+        pred_depth=6,
+        pred_embed_dim=384,
+        uniform_power=False,
+        use_mask_tokens=False,
+        num_mask_tokens=2,
+        zero_init_mask_tokens=True,
+        use_sdpa=False,
+    ):
+        encoder = video_vit.__dict__[model_name](
+            img_size=crop_size,
+            patch_size=patch_size,
+            num_frames=num_frames,
+            tubelet_size=tubelet_size,
+            uniform_power=uniform_power,
+            use_sdpa=use_sdpa,
+        )
+        encoder = MultiMaskWrapper(encoder)
+        predictor = vit_pred.__dict__['vit_predictor'](
+            img_size=crop_size,
+            use_mask_tokens=use_mask_tokens,
+            patch_size=patch_size,
+            num_frames=num_frames,
+            tubelet_size=tubelet_size,
+            embed_dim=encoder.backbone.embed_dim,
+            predictor_embed_dim=pred_embed_dim,
+            depth=pred_depth,
+            num_heads=encoder.backbone.num_heads,
+            uniform_power=uniform_power,
+            num_mask_tokens=num_mask_tokens,
+            zero_init_mask_tokens=zero_init_mask_tokens,
+            use_sdpa=use_sdpa,
+        )
+        predictor = PredictorMultiMaskWrapper(predictor)
 
-    
+        def init_weights(m):
+            if isinstance(m, torch.nn.Linear):
+                trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0)
+            elif isinstance(m, torch.nn.LayerNorm):
+                torch.nn.init.constant_(m.bias, 0)
+                torch.nn.init.constant_(m.weight, 1.0)
+
+        for m in encoder.modules():
+            init_weights(m)
+
+        for m in predictor.modules():
+            init_weights(m)
+
+        encoder.to(device)
+        predictor.to(device)
+        
+        logger = get_logger(__name__)
+        logger.info(encoder)
+        logger.info(predictor)
+
+        def count_parameters(model):
+            return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        logger.info(f'Encoder number of parameters: {count_parameters(encoder)}')
+        logger.info(f'Predictor number of parameters: {count_parameters(predictor)}')
+
+        return encoder, predictor
+
+        
