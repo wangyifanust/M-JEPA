@@ -13,10 +13,6 @@ import json
 
 
 def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_decay=.75):
-    """
-    Parameter groups for layer-wise lr decay
-    Following BEiT: https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L58
-    """
     param_group_names = {}
     param_groups = {}
 
@@ -28,14 +24,13 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
         if not p.requires_grad:
             continue
 
-        # no decay: all 1D parameters and model specific ones
         if p.ndim == 1 or n in no_weight_decay_list:
             g_decay = "no_decay"
             this_decay = 0.
         else:
             g_decay = "decay"
             this_decay = weight_decay
-            
+
         layer_id = get_layer_id_for_vit(n, num_layers)
         group_name = "layer_%d_%s" % (layer_id, g_decay)
 
@@ -46,19 +41,17 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
                 "lr_scale": this_scale,
                 "weight_decay": this_decay,
                 "params": [],
-                "betas": (0.9, 0.999),
+                "betas": (0.9, 0.999),  # 添加 betas 参数
             }
             param_groups[group_name] = {
                 "lr_scale": this_scale,
                 "weight_decay": this_decay,
                 "params": [],
-                "betas": (0.9, 0.999),
+                "betas": (0.9, 0.999),  # 添加 betas 参数
             }
 
         param_group_names[group_name]["params"].append(n)
         param_groups[group_name]["params"].append(p)
-
-    # print("parameter groups: \n%s" % json.dumps(param_group_names, indent=2))
 
     return list(param_groups.values())
 
