@@ -262,7 +262,7 @@ class Transformer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(dim_feat)
-        
+
         if protocol == 'linprobe':
             self.head = ActionHeadLinprobe(dim_feat=dim_feat, num_classes=num_classes)
         elif protocol == 'finetune':
@@ -280,6 +280,12 @@ class Transformer(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         # --------------------------------------------------------------------------
+        self.teacher = None
+        self.set_teacher()
+    def set_teacher(self):
+        if self.teacher is None:
+            self.teacher = self.Teacher(self)
+        return self.teacher
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -291,40 +297,68 @@ class Transformer(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    # class Teacher(nn.Module):
-    #     def __init__(self, teacher_encoder):
-    #         super().__init__()
-    #         self.encoder = copy.deepcopy(teacher_encoder)
-    #         for param in self.encoder.parameters():
-    #             param.requires_grad = False
-    #     def forward(self, x):
-    #         return self.encoder(x)
+    class Teacher(nn.Module):
+        def __init__(self, transformer):
+            super().__init__()
+            # Copy only the encoder components to avoid infinite recursion
+            self.joints_embed = copy.deepcopy(transformer.joints_embed)
+            self.blocks = copy.deepcopy(transformer.blocks)
+            self.norm = copy.deepcopy(transformer.norm)
+            self.temp_embed = copy.deepcopy(transformer.temp_embed)
+            self.pos_embed = copy.deepcopy(transformer.pos_embed)
+            for param in self.parameters():
+                param.requires_grad = True  # Freeze teacher parameters
 
-        
+        def forward(self, x):
+            # Encoder forward pass
+            x = self.joints_embed(x)
+            NM, TP, VP, _ = x.shape
+            x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+            x = x.reshape(NM, TP * VP, -1)
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.norm(x)
+            return x
 
+
+    # def forward(self, x):
+    #     N, C, T, V, M = x.shape
+    #     x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+
+    #     # embed skeletons
+    #     x = self.joints_embed(x)
+
+    #     NM, TP, VP, _ = x.shape
+
+    #     # add pos & temp embed
+    #     x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+
+    #     # masking: length -> length * mask_ratio
+    #     x = x.reshape(NM, TP * VP, -1)
+
+    #     # apply Transformer blocks
+    #     for idx, blk in enumerate(self.blocks):
+    #         x = blk(x)
+
+    #     x = self.norm(x)
+
+    #     x = x.reshape(N, M, TP, VP, -1)
+
+    #     x = self.head(x)
+ 
+    #     return x
     def forward(self, x):
         N, C, T, V, M = x.shape
-        x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+        x2 = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+        x2 = self.joints_embed(x2)
 
+        NM, TP, VP, _ = x2.shape
         # embed skeletons
-        x = self.joints_embed(x)
-
-        NM, TP, VP, _ = x.shape
-
-        # add pos & temp embed
-        x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
-
-        # masking: length -> length * mask_ratio
-        x = x.reshape(NM, TP * VP, -1)
-
-        # apply Transformer blocks
-        for idx, blk in enumerate(self.blocks):
-            x = blk(x)
-
-        x = self.norm(x)
+        teacher = self.set_teacher()
+        x= x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+        x= teacher(x)
 
         x = x.reshape(N, M, TP, VP, -1)
 
         x = self.head(x)
- 
         return x

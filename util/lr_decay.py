@@ -46,11 +46,13 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
                 "lr_scale": this_scale,
                 "weight_decay": this_decay,
                 "params": [],
+                "betas": (0.9, 0.999),
             }
             param_groups[group_name] = {
                 "lr_scale": this_scale,
                 "weight_decay": this_decay,
                 "params": [],
+                "betas": (0.9, 0.999),
             }
 
         param_group_names[group_name]["params"].append(n)

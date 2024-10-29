@@ -234,41 +234,52 @@ def main(args):
     args.eval=False
     print("arg.fineturn = %s" % str(args.finetune))
     if args.finetune and not args.eval:
+        # if args.finetune and not args.eval:
+    # 加载预训练模型
         checkpoint = torch.load(args.finetune, map_location='cpu')
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
-        # checkpoint_model = checkpoint['model']
         checkpoint_model = checkpoint['model']
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
 
-        # interpolate position embedding
+        # 移除分类头参数，如果形状不匹配
+        for k in ['head.weight', 'head.bias']:
+            if k in checkpoint_model and k in model.state_dict():
+                if checkpoint_model[k].shape != model.state_dict()[k].shape:
+                    print(f"Removing key {k} from pretrained checkpoint due to shape mismatch.")
+                    del checkpoint_model[k]
+
+        # 插值位置嵌入（如果需要）
         interpolate_temp_embed(model, checkpoint_model)
 
-        # load pre-trained model
-        msg = model.load_state_dict(checkpoint_model, strict=False)
-        try:
-            teacher_model = model.Teacher
-        except:
-            teacher_model = None
-            print("No teacher model found in the model")
-        if teacher_model is not None:
-            teacher_model.load_state_dict(checkpoint_model, strict=False)
-        
-        
-        print(msg)
+        # 准备教师子模块的 state_dict
+        teacher_state_dict = {}
+        teacher_keys = ['joints_embed', 'blocks', 'norm', 'temp_embed', 'pos_embed']
+        for k, v in checkpoint_model.items():
+            if any(k.startswith(prefix) for prefix in teacher_keys):
+                # 直接使用原始键名，因为我们将它们加载到 teacher 子模块中
+                teacher_state_dict[k] = v
 
+        # 加载教师子模块的 state_dict
+        teacher_msg = model.teacher.load_state_dict(teacher_state_dict, strict=False)
+        print(teacher_msg)
+
+        # 检查教师子模块的缺失键
         missing_keys_check_passed = True
-        for k in set(msg.missing_keys):
-            if ('head' not in k) and ('pre_logits' not in k):
-                missing_keys_check_passed = False
-        assert missing_keys_check_passed == True
-        model=teacher_model 
-        # # manually initialize fc layer
-        # trunc_normal_(model.head.weight, std=2e-5)
+        for k in set(teacher_msg.missing_keys):
+            print(f"Missing key in teacher: {k}")
+            missing_keys_check_passed = False
+        assert missing_keys_check_passed, "存在关键参数未加载到 teacher 子模块，请检查上述缺失键。"
+
+        # 将模型和教师子模块移动到设备上
+        model = model.to(device)
+        if model.teacher is not None:
+            model.teacher = model.teacher.to(device)
+            print("Teacher model loaded and moved to device.")
+        else:
+            print("No teacher model found in the model.")
+
+        print("Model and teacher model loaded successfully.")
+
 
     model.to(device)
 
@@ -298,10 +309,16 @@ def main(args):
         layer_decay=args.layer_decay
     )
     
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    # optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr,betas=(0.9, 0.999), eps=1e-8)
 
 
     loss_scaler = NativeScaler()
+    for param_group in optimizer.param_groups:
+        required_keys = ['params', 'lr', 'betas', 'weight_decay']
+        for key in required_keys:
+            if key not in param_group:
+                print(f"Warning: '{key}' not found in optimizer param_group.")
 
     if mixup_fn is not None:
         # smoothing is handled with mixup label transform
