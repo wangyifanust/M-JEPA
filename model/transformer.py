@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 import warnings
 from .drop import DropPath
-
+import copy
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
@@ -262,7 +262,7 @@ class Transformer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(dim_feat)
-
+        
         if protocol == 'linprobe':
             self.head = ActionHeadLinprobe(dim_feat=dim_feat, num_classes=num_classes)
         elif protocol == 'finetune':
@@ -290,6 +290,17 @@ class Transformer(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    # class Teacher(nn.Module):
+    #     def __init__(self, teacher_encoder):
+    #         super().__init__()
+    #         self.encoder = copy.deepcopy(teacher_encoder)
+    #         for param in self.encoder.parameters():
+    #             param.requires_grad = False
+    #     def forward(self, x):
+    #         return self.encoder(x)
+
+        
 
     def forward(self, x):
         N, C, T, V, M = x.shape

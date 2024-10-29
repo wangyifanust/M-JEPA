@@ -260,13 +260,28 @@ class Transformer(nn.Module):
             t_patch_size * patch_size * dim_in,
             bias=True
         ) # decoder to patch
+        
         # --------------------------------------------------------------------------
 
         # --------------------------------------------------------------------------
         # Initialize weights
         self.apply(self._init_weights)
+        # self.Teacher = self.Teacher(self)
+        # self.Student = self.Student(self)
         # --------------------------------------------------------------------------
+        self.teacher = None
+        self.student = None
+        self.get_teacher()
+        self.get_student()
+    def get_teacher(self):
+        if self.teacher is None:
+            self.teacher = self.Teacher(self)
+        return self.teacher
 
+    def get_student(self):
+        if self.student is None:
+            self.student = self.Student(self)
+        return self.student
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -409,9 +424,9 @@ class Transformer(nn.Module):
 
     # Teacher sub-class
     class Teacher(nn.Module):
-        def __init__(self, student_encoder):
+        def __init__(self, teacher_encoder):
             super().__init__()
-            self.encoder = copy.deepcopy(student_encoder)
+            self.encoder = copy.deepcopy(teacher_encoder)
             for param in self.encoder.parameters():
                 param.requires_grad = False
 
@@ -426,9 +441,9 @@ class Transformer(nn.Module):
         def __init__(self, transformer):
             super().__init__()
             # self.encoder = copy.deepcopy(transformer)
-            # self.decoder = copy.deepcopy(transformer)
             # self.forward_loss = copy.deepcopy(transformer.forward_loss)
-            self.transformer = transformer
+            # self.transformer = transformer
+            self.transformer = copy.deepcopy(transformer)
             for param in self.transformer.parameters():
                 param.requires_grad = True
         def forward(self, x, mask_ratio, motion_aware_tau=0.75):
@@ -447,11 +462,34 @@ class Transformer(nn.Module):
         #     var = target.var(dim=-1, keepdim=True)
         #     target = (target - mean) / (var + 1.0e-6) ** 0.5
         
-        recon_loss = F.l1_loss(student_latent, teacher_latent, reduction='none')
+        # recon_loss = F.l1_loss(student_latent, teacher_latent, reduction='none')
+        recon_loss = F.mse_loss(student_latent, teacher_latent, reduction='none')
         recon_loss = (recon_loss.mean(dim=-1) * mask).sum() / mask.sum()
-        # contrastive_loss = F.mse_loss(teacher_latent, target, reduction='none')
-        # total_loss = recon_loss + contrastive_loss
+        student_motion=self.decoder_pred(student_latent)
+        target = self.patchify(target)  # [NM, TP * VP, C]
 
+        if self.norm_skes_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.0e-6) ** 0.5
+        # print('student_motion.shape', student_motion.shape)
+        # print('target.shape', target.shape)
+        # loss = (student_motion - target) ** 2
+        # loss = loss.mean(dim=-1)  # [NM, TP * VP], mean loss per patch
+        
+        # # teacher_motion=self.decoder_pred(teacher_latent)
+        # lambda2 = 0.25
+        # # contrastive_loss = F.mse_loss(student_motion, target, reduction='none')
+        # recon_loss = recon_loss + lambda2 * loss.mean()
+
+
+        # contrastive_loss = F.mse_loss(teacher_latent, target, reduction='none')
+        # total_loss = recon_loss + lambda2*contrastive_loss
+        # v2 recon with original
+        teacher_motion=self.decoder_pred(teacher_latent)
+        lambda2 = 0.25
+        contrastive_loss = F.mse_loss(student_motion, teacher_motion, reduction='none')
+        recon_loss = recon_loss + lambda2 * contrastive_loss.mean()
         # EMA update for teacher encoder
         with torch.no_grad():
             student_params = dict(student.transformer.named_parameters())
@@ -509,13 +547,16 @@ class Transformer(nn.Module):
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
         x_motion = self.extract_motion(x, motion_stride)
 
-        teacher = self.Teacher(self)
+        # teacher = self.Teacher(self)
+        # teacher=self.Teacher
+        teacher = self.get_teacher()
         teacher_latent, mask, ids_restore = teacher(x, motion_aware_tau, mask_ratio)
         # print('teacher_latent.shape', teacher_latent.shape)
         # print('mask1.shape', mask.shape)
         # print('ids_restore1.shape', ids_restore.shape)
-
-        student = self.Student(self)
+        # student=self.Student
+        # student = self.Student(self)
+        student = self.get_student()
         pred, mask, ids_restore2= student(x, mask_ratio, motion_aware_tau)
         student_latent = pred
         # print('student_latent.shape', student_latent.shape)
