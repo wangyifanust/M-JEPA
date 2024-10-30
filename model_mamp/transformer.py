@@ -269,19 +269,20 @@ class Transformer(nn.Module):
         # self.Teacher = self.Teacher(self)
         # self.Student = self.Student(self)
         # --------------------------------------------------------------------------
-        self.teacher = None
-        self.student = None
-        self.get_teacher()
-        self.get_student()
-    def get_teacher(self):
-        if self.teacher is None:
-            self.teacher = self.Teacher(self)
-        return self.teacher
+        self.teacher = self.Teacher(self)
+        self.student = self.Student(self)
+    #     self.get_teacher()
+    #     self.get_student()
+    #     # self.teacher=self.Teacher(self.encoder)
+    # def get_teacher(self):
+    #     if self.teacher is None:
+    #         self.teacher = self.Teacher(self)
+    #     return self.teacher
 
-    def get_student(self):
-        if self.student is None:
-            self.student = self.Student(self)
-        return self.student
+    # def get_student(self):
+    #     if self.student is None:
+    #         self.student = self.Student(self)
+    #     return self.student
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -424,35 +425,255 @@ class Transformer(nn.Module):
 
     # Teacher sub-class
     class Teacher(nn.Module):
-        def __init__(self, teacher_encoder):
+        def __init__(self, parent):
             super().__init__()
-            self.encoder = copy.deepcopy(teacher_encoder)
-            for param in self.encoder.parameters():
+            # Copy the encoder components from the parent without sharing parameters
+            self.joints_embed = copy.deepcopy(parent.joints_embed)
+            self.blocks = copy.deepcopy(parent.blocks)
+            self.norm = copy.deepcopy(parent.norm)
+            self.temp_embed = copy.deepcopy(parent.temp_embed)
+            self.pos_embed = copy.deepcopy(parent.pos_embed)
+        
+            # Make teacher parameters not trainable
+            for param in self.parameters():
                 param.requires_grad = False
 
-        def forward(self, x, motion_aware_tau=0.0, mask_ratio=0.0):
-            mask_ratio = 0.0
+        def forward(self, x, mask_ratio=0.0, motion_aware_tau=0.0):
             with torch.no_grad():
-                return self.encoder.forward_encoder(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
+                return self.forward_encoder(x, mask_ratio, motion_aware_tau)
+        def motion_aware_random_masking(self, x, x_orig, mask_ratio, tau):
+            """
+            Perform per-sample random masking by per-sample shuffling.
+            Per-sample shuffling is done by argsort random noise.
+            x: [NM, L, D], sequence
+            x_orig: patchified original skeleton sequence
+            """
+            NM, L, D = x.shape  # batch, length, dim
+            _, TP, VP, _ = x_orig.shape
+            
+            len_keep = int(L * (1 - mask_ratio))
+
+            x_orig_motion = torch.zeros_like(x_orig)
+            x_orig_motion[:, 1:, :, :] = torch.abs(x_orig[:, 1:, :, :] - x_orig[:, :-1, :, :])
+            x_orig_motion[:, 0, :, :] = x_orig_motion[:, 1, :, :]
+            x_orig_motion = x_orig_motion.mean(dim=[3])  # NM, TP, VP
+            x_orig_motion = x_orig_motion.reshape(NM, L)
+
+            x_orig_motion = x_orig_motion / (torch.max(x_orig_motion, dim=-1, keepdim=True).values * tau + 1e-10)
+            x_orig_motion_prob = F.softmax(x_orig_motion, dim=-1)
+
+            noise = torch.log(x_orig_motion_prob) - torch.log(-torch.log(torch.rand(NM, L, device=x.device) + 1e-10) + 1e-10)  # gumble
+
+            # noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+            # sort noise for each sample
+            ids_shuffle = torch.argsort(
+                noise, dim=1
+            )  # ascend: small is keep, large is remove
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+            # keep the first subset
+            ids_keep = ids_shuffle[:, :len_keep]
+            x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+            # generate the binary mask: 0 is keep, 1 is remove
+            mask = torch.ones([NM, L], device=x.device)
+            mask[:, :len_keep] = 0
+            # unshuffle to get the binary mask
+            mask = torch.gather(mask, dim=1, index=ids_restore)
+
+            return x_masked, mask, ids_restore, ids_keep
+
+        def random_masking(self, x, mask_ratio):
+            """
+            Perform per-sample random masking by per-sample shuffling.
+            Per-sample shuffling is done by argsort random noise.
+            x: [N, L, D], sequence
+            """
+            N, L, D = x.shape  # batch, length, dim
+            len_keep = int(L * (1 - mask_ratio))
+
+            noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+            # sort noise for each sample
+            ids_shuffle = torch.argsort(
+                noise, dim=1
+            )  # ascend: small is keep, large is remove
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+            # keep the first subset
+            ids_keep = ids_shuffle[:, :len_keep]
+            x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+            # generate the binary mask: 0 is keep, 1 is remove
+            mask = torch.ones([N, L], device=x.device)
+            mask[:, :len_keep] = 0
+            # unshuffle to get the binary mask
+            mask = torch.gather(mask, dim=1, index=ids_restore)
+
+            return x_masked, mask, ids_restore, ids_keep
+        
+        def forward_encoder(self, x, mask_ratio, motion_aware_tau):
+            x_orig = self.patchify(x)
+
+            # embed skeletons
+            x = self.joints_embed(x)
+
+            NM, TP, VP, _ = x.shape
+
+            # add pos & temp embed
+            x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+
+            # masking: length -> length * mask_ratio
+            x = x.reshape(NM, TP * VP, -1)
+            # print('x.shape', x.shape)
+            if motion_aware_tau > 0:
+                x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
+                # print('x_orig.shape', x_orig.shape)
+                x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+            else:   
+                x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+            # print('x.shape', x.shape)
+            # print('mask.shape', mask.shape)
+            # print('ids_restore.shape', ids_restore.shape)
+
+            # apply Transformer blocks
+            for idx, blk in enumerate(self.blocks):
+                x = blk(x)
+
+            x = self.norm(x)
+
+            return x, mask, ids_restore
+            
 
 
     # Student sub-class
     class Student(nn.Module):
-        def __init__(self, transformer):
+        def __init__(self, parent):
             super().__init__()
-            # self.encoder = copy.deepcopy(transformer)
-            # self.forward_loss = copy.deepcopy(transformer.forward_loss)
-            # self.transformer = transformer
-            self.transformer = copy.deepcopy(transformer)
-            for param in self.transformer.parameters():
+            # Copy the encoder components from the parent without sharing parameters
+            self.joints_embed = copy.deepcopy(parent.joints_embed)
+            self.blocks = copy.deepcopy(parent.blocks)
+            self.norm = copy.deepcopy(parent.norm)
+            self.temp_embed = copy.deepcopy(parent.temp_embed)
+            self.pos_embed = copy.deepcopy(parent.pos_embed)
+            self.parent = parent
+            # Make student parameters trainable
+            for param in self.parameters():
                 param.requires_grad = True
+
+        def motion_aware_random_masking(self, x, x_orig, mask_ratio, tau):
+            """
+            Perform per-sample random masking by per-sample shuffling.
+            Per-sample shuffling is done by argsort random noise.
+            x: [NM, L, D], sequence
+            x_orig: patchified original skeleton sequence
+            """
+            NM, L, D = x.shape  # batch, length, dim
+            _, TP, VP, _ = x_orig.shape
+            
+            len_keep = int(L * (1 - mask_ratio))
+
+            x_orig_motion = torch.zeros_like(x_orig)
+            x_orig_motion[:, 1:, :, :] = torch.abs(x_orig[:, 1:, :, :] - x_orig[:, :-1, :, :])
+            x_orig_motion[:, 0, :, :] = x_orig_motion[:, 1, :, :]
+            x_orig_motion = x_orig_motion.mean(dim=[3])  # NM, TP, VP
+            x_orig_motion = x_orig_motion.reshape(NM, L)
+
+            x_orig_motion = x_orig_motion / (torch.max(x_orig_motion, dim=-1, keepdim=True).values * tau + 1e-10)
+            x_orig_motion_prob = F.softmax(x_orig_motion, dim=-1)
+
+            noise = torch.log(x_orig_motion_prob) - torch.log(-torch.log(torch.rand(NM, L, device=x.device) + 1e-10) + 1e-10)  # gumble
+
+            # noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+            # sort noise for each sample
+            ids_shuffle = torch.argsort(
+                noise, dim=1
+            )  # ascend: small is keep, large is remove
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+            # keep the first subset
+            ids_keep = ids_shuffle[:, :len_keep]
+            x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+            # generate the binary mask: 0 is keep, 1 is remove
+            mask = torch.ones([NM, L], device=x.device)
+            mask[:, :len_keep] = 0
+            # unshuffle to get the binary mask
+            mask = torch.gather(mask, dim=1, index=ids_restore)
+
+            return x_masked, mask, ids_restore, ids_keep
+
+        def random_masking(self, x, mask_ratio):
+            """
+            Perform per-sample random masking by per-sample shuffling.
+            Per-sample shuffling is done by argsort random noise.
+            x: [N, L, D], sequence
+            """
+            N, L, D = x.shape  # batch, length, dim
+            len_keep = int(L * (1 - mask_ratio))
+
+            noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+            # sort noise for each sample
+            ids_shuffle = torch.argsort(
+                noise, dim=1
+            )  # ascend: small is keep, large is remove
+            ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+            # keep the first subset
+            ids_keep = ids_shuffle[:, :len_keep]
+            x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+            # generate the binary mask: 0 is keep, 1 is remove
+            mask = torch.ones([N, L], device=x.device)
+            mask[:, :len_keep] = 0
+            # unshuffle to get the binary mask
+            mask = torch.gather(mask, dim=1, index=ids_restore)
+
+            return x_masked, mask, ids_restore, ids_keep
+        
+        def forward_encoder(self, x, mask_ratio, motion_aware_tau):
+            x_orig = self.patchify(x)
+
+            # embed skeletons
+            x = self.joints_embed(x)
+
+            NM, TP, VP, _ = x.shape
+
+            # add pos & temp embed
+            x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+
+            # masking: length -> length * mask_ratio
+            x = x.reshape(NM, TP * VP, -1)
+            # print('x.shape', x.shape)
+            if motion_aware_tau > 0:
+                x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
+                # print('x_orig.shape', x_orig.shape)
+                x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+            else:   
+                x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+            # print('x.shape', x.shape)
+            # print('mask.shape', mask.shape)
+            # print('ids_restore.shape', ids_restore.shape)
+
+            # apply Transformer blocks
+            for idx, blk in enumerate(self.blocks):
+                x = blk(x)
+
+            x = self.norm(x)
+
+            return x, mask, ids_restore
+        
         def forward(self, x, mask_ratio, motion_aware_tau=0.75):
             # N, C, T, V, M = x.shape
             # x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
             # x_motion = self.extract_motion(x, motion_stride)
-            latent, mask, ids_restore = self.transformer.forward_encoder(x, mask_ratio, motion_aware_tau)
-            pred = self.transformer.forward_decoder(latent, ids_restore)
-            return pred, mask, ids_restore
+            latent, mask, ids_restore = self.parent.forward_encoder(x, mask_ratio, motion_aware_tau)
+            # pred = self.transformer.forward_decoder(latent, ids_restore)
+            # return pred, mask, ids_restore
+            return latent, mask, ids_restore
 
     # Forward loss using L1 loss and EMA updating
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, student, teacher, ema_decay=0.999):
@@ -549,22 +770,24 @@ class Transformer(nn.Module):
 
         # teacher = self.Teacher(self)
         # teacher=self.Teacher
-        teacher = self.get_teacher()
-        teacher_latent, mask, ids_restore = teacher(x, motion_aware_tau, mask_ratio)
+        
+        teacher_latent, mask, ids_restore = self.teacher(x, motion_aware_tau, mask_ratio)
         # print('teacher_latent.shape', teacher_latent.shape)
         # print('mask1.shape', mask.shape)
         # print('ids_restore1.shape', ids_restore.shape)
         # student=self.Student
         # student = self.Student(self)
-        student = self.get_student()
-        pred, mask, ids_restore2= student(x, mask_ratio, motion_aware_tau)
-        student_latent = pred
+        # student = self.get_student()
+        #         # student = self.Student(self)
+        # student = self.get_student()
+        student_mask_latent, mask, ids_restore = self.student(x, mask_ratio, motion_aware_tau)
+        student_latent=self.forward_decoder(student_mask_latent, ids_restore)
         # print('student_latent.shape', student_latent.shape)
         # print('pred.shape', pred.shape)
         # print('mask2.shape', mask.shape)
 
-        loss = self.forward_loss(student_latent, teacher_latent, x_motion, mask, ids_restore, student, teacher)
+        loss = self.forward_loss(student_latent, teacher_latent, x_motion, mask, ids_restore, self.student, self.teacher)
         
-        return loss, pred, mask
+        return loss, student_latent, mask
 
     
