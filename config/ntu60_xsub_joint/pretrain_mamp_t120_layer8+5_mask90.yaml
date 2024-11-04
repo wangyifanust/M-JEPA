@@ -1,7 +1,7 @@
 # data
 feeder: feeder.feeder_ntu.Feeder
 train_feeder_args:
-  data_path: data/ntu/NTU60_XSub.npz
+  data_path: /work/vita/datasets/NTU/NTU60_XSub.npz
   split: train
   debug: False
   random_choose: False
@@ -15,7 +15,7 @@ train_feeder_args:
   bone: False
 
 # model
-model: model_mamp.transformer.Transformer
+model: model_mamp.transformer.Model
 model_args:
   dim_in: 3
   dim_feat: 256

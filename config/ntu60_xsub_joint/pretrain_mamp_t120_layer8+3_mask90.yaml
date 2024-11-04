@@ -1,7 +1,7 @@
 # data
 feeder: feeder.feeder_ntu.Feeder
 train_feeder_args:
-  data_path: data/ntu/NTU60_XSub.npz
+  data_path: /work/vita/datasets/NTU/NTU60_XSub.npz
   split: train
   debug: False
   random_choose: False
@@ -30,9 +30,9 @@ model_args:
   t_patch_size: 4
   qkv_bias: True
   qk_scale: None
-  drop_rate: 0.
-  attn_drop_rate: 0.
-  drop_path_rate: 0.
+  drop_rate: 0.1
+  attn_drop_rate: 0.1
+  drop_path_rate: 0.1
   norm_skes_loss: True
 
 # training
