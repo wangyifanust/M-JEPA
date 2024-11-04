@@ -767,11 +767,13 @@ class Model(nn.Module):
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
         x_motion = self.extract_motion(x, motion_stride)
         # x_embed = self.joints_embed(x)
-
+        # get teacher latent from teacher encoder
         teacher_latent, maskteacher, ids_restoreteacher = self.teacher(x,mask_ratio=0.0, motion_aware_tau=0.0)
+        # get student latent from student encoder after masking
         student_latent, mask, ids_restore= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
+        # predict student latent using predictor
         student_latent_predicted = self.predictor(student_latent, ids_restore)
-        # print('student_latent', student_latent.shape)
+        # print('student_latent_predicted ', student_latent_predicted .shape)
         # print('teacher_latent', teacher_latent.shape)
         loss = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
         
