@@ -606,7 +606,8 @@ class Transformer(nn.Module):
 # class complete_mode:
 #   self.student = encoder()
 #   self.teacher = encoder() or copy.deepcopy(self.student)
-#   self.predictor = predictor()
+#   self.predictor = predictor() // decoder it is in the model class
+
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
@@ -623,7 +624,7 @@ class Model(nn.Module):
 
         self.norm_skes_loss = norm_skes_loss
         
-        # Encoder specifics
+        # MAE Encoder specifics
         self.joints_embed = SkeleEmbed(dim_in, dim_feat, num_frames, num_joints, patch_size, t_patch_size)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -638,7 +639,7 @@ class Model(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints//patch_size, dim_feat))
         trunc_normal_(self.temp_embed, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
-        # Decoder specifics
+        # MAE Decoder specifics
         self.decoder_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
         
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim_feat))
@@ -663,6 +664,7 @@ class Model(nn.Module):
         ) # decoder to patch
 
         # Initialize weights
+
         self.apply(self._init_weights)
         self.teacher = Encoder(is_teacher=True)
         self.student = Encoder(is_teacher=False)
@@ -700,38 +702,54 @@ class Model(nn.Module):
         return x
 
     def predictor(self, x, ids_restore):
+        # predict the student latent 
         NM = x.shape[0]
         TP = self.joints_embed.t_grid_size
         VP = self.joints_embed.grid_size
+
+        # embed tokens
         x = self.decoder_embed(x)
         C = x.shape[-1]
+        # append intra mask tokens to sequence
         mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
-        x_ = torch.cat([x, mask_tokens], dim=1)
+        x_ = torch.cat([x, mask_tokens], dim=1)# no cls token
 
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))# unshuffle
+
         x = x_.view([NM, TP, VP, C])
+        # add pos & temp embed
         x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
+        # apply Transformer blocks
         x = x.reshape(NM, TP * VP, C)
+
         for blk in self.decoder_blocks:
             x = blk(x)
+
         x = self.decoder_norm(x)
         return x
 
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
+        # contrastive loss between student latent after prediction and teacher latent
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
         
         recon_loss_latent = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
+        # decode student motion into original motion 
         student_orginal_motion = self.decoder_pred(student_latent)
-        target = self.patchify(target)
+        
+        # original motion from target
+        target = self.patchify(target) # [NM, TP * VP, C]
+
 
         if self.norm_skes_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.0e-6) ** 0.5
-
+        # decode teacher motion into original motion
         teacher_orginal_motion = self.decoder_pred(teacher_latent)
-        lambda2 = 0.1
+        # contrastive loss between student motion and original motion
+        lambda2 = 0.0
         contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
+
         recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
 
         # EMA update for teacher encoder
@@ -742,7 +760,9 @@ class Model(nn.Module):
                 if name in teacher_params:
                     teacher_params[name].data.mul_(ema_decay).add_(student_params[name].data * (1 - ema_decay))
         return recon_loss
+    
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
+        
         N, C, T, V, M = x.shape
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
         x_motion = self.extract_motion(x, motion_stride)
@@ -765,6 +785,7 @@ class Encoder(nn.Module):
                  qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, norm_skes_loss=False,mask_ratio=0.0, motion_aware_tau=0.0,is_teacher=True):
         super().__init__()
+        # MAE decoder specifics
         self.joints_embed = SkeleEmbed(dim_in, dim_feat, num_frames, num_joints, patch_size, t_patch_size)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -785,7 +806,8 @@ class Encoder(nn.Module):
         self.t_patch_size = t_patch_size
         self.mask_ratio = mask_ratio
         self.motion_aware_tau = motion_aware_tau
-        
+        # Initialize weights
+        self.apply(self.init_weights)
         # Make teacher parameters not trainable
         if is_teacher:
             for param in self.parameters():
@@ -805,6 +827,10 @@ class Encoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
     def patchify(self, imgs):
+        """
+        imgs: (N, T, V, 3)
+        x: (N, L, t_patch_size * patch_size * 3)
+        """
         NM, T, V, C = imgs.shape
         p = self.patch_size
         u = self.t_patch_size
@@ -818,6 +844,12 @@ class Encoder(nn.Module):
         return x
 
     def motion_aware_random_masking(self, x, x_orig, mask_ratio, tau):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [NM, L, D], sequence
+        x_orig: patchified original skeleton sequence
+        """
         NM, L, D = x.shape  # batch, length, dim
         _, TP, VP, _ = x_orig.shape
             
@@ -853,6 +885,11 @@ class Encoder(nn.Module):
         return x_masked, mask, ids_restore, ids_keep
 
     def random_masking(self, x, mask_ratio):
+        """
+        Perform per-sample random masking by per-sample shuffling.
+        Per-sample shuffling is done by argsort random noise.
+        x: [N, L, D], sequence
+        """
         N, L, D = x.shape  # batch, length, dim
         len_keep = int(L * (1 - mask_ratio))
 
@@ -879,7 +916,7 @@ class Encoder(nn.Module):
     def forward_encoder(self,x, mask_ratio, motion_aware_tau):
         
         x_orig = self.patchify(x)
-        # x = x_embed
+
         # embed skeletons
         x = self.joints_embed(x)
 
