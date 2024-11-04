@@ -181,7 +181,8 @@ def main(args):
     # define the model
     Model = import_class(args.model)
     model = Model(**args.model_args)
-
+    # for name, param in model.named_parameters():
+    #     print(name, param.requires_grad)
     model.to(device)
 
     model_without_ddp = model

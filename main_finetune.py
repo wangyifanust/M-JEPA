@@ -301,7 +301,8 @@ def main(args):
     print("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
     # build optimizer with layer-wise lr decay (lrd)
@@ -310,15 +311,15 @@ def main(args):
     )
     
     # optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr,betas=(0.9, 0.999), eps=1e-8)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, eps=1e-8)
 
 
     loss_scaler = NativeScaler()
-    for param_group in optimizer.param_groups:
-        required_keys = ['params', 'lr', 'betas', 'weight_decay']
-        for key in required_keys:
-            if key not in param_group:
-                print(f"Warning: '{key}' not found in optimizer param_group.")
+    # for param_group in optimizer.param_groups:
+    #     required_keys = ['params', 'lr', 'betas', 'weight_decay']
+    #     for key in required_keys:
+    #         if key not in param_group:
+    #             print(f"Warning: '{key}' not found in optimizer param_group.")
 
     if mixup_fn is not None:
         # smoothing is handled with mixup label transform
@@ -351,7 +352,7 @@ def main(args):
             args=args
         )
         if args.output_dir:
-            misc.save_model(
+            misc.save_model2(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 
