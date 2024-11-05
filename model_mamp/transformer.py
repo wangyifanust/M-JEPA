@@ -808,10 +808,11 @@ class Encoder(nn.Module):
         self.t_patch_size = t_patch_size
         self.mask_ratio = mask_ratio
         self.motion_aware_tau = motion_aware_tau
+        self.is_teacher = is_teacher
         # Initialize weights
         self.apply(self.init_weights)
         # Make teacher parameters not trainable
-        if is_teacher:
+        if self.is_teacher:
             for param in self.parameters():
                 param.requires_grad = False
             self.mask_ratio = 0.0
@@ -944,7 +945,10 @@ class Encoder(nn.Module):
         return x, mask, ids_restore
 
     def forward(self, x, mask_ratio=0.0, motion_aware_tau=0.0):
-        with torch.no_grad():
+        if self.is_teacher:
+            with torch.no_grad():
+                return self.forward_encoder(x, mask_ratio, motion_aware_tau)
+        else:
             return self.forward_encoder(x, mask_ratio, motion_aware_tau)
 
 
