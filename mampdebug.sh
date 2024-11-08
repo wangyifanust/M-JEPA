@@ -3,7 +3,7 @@
 #SBATCH --output=slurm_out3/%j.out
 #SBATCH --error=slurm_out3/%j.err
 #SBATCH --mem=60G                      
-#SBATCH --time=24:20:00
+#SBATCH --time=47:20:00
 #SBATCH --partition=l40s
 #SBATCH --account=vita
 #SBATCH --cpus-per-task=40
@@ -24,8 +24,8 @@ echo "Running on host: $HOSTNAME"
 
 
 
-python -m torch.distributed.launch --nproc_per_node=4 --master_port 11234 main_pretrain.py \
---config ./config/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_mask90.yaml \
---output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_mask90_tau0.80_ep400_noamp_L2+0.1reconv2 \
---log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_mask90_tau0.80_ep400_noamp_L2+0.1reconv2
+python -m torch.distributed.launch --nproc_per_node=4   --master_port 11234 main_pretrain.py \
+--config ./config/ntu60_xsub_joint/pretrain_mamp_t120_layer8+5_mask90.yaml \
+--output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+5_mask90_tau0.80_ep400_noamp_L2_.05reconv6_mom \
+--log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+5_mask90_tau0.80_ep400_noamp_L2_.05reconv6_mom \
 

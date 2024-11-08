@@ -36,7 +36,7 @@ model_args:
   norm_skes_loss: True
 
 # training
-epochs: 400
+epochs: 800
 warmup_epochs: 20
 batch_size: 32
 lr: 1e-3

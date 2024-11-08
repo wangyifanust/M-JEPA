@@ -15,7 +15,7 @@ train_feeder_args:
   bone: False
 
 # model
-model: model_mamp.transformer.Transformer
+model: model_mamp.transformer.Model
 model_args:
   dim_in: 3
   dim_feat: 256
@@ -30,9 +30,9 @@ model_args:
   t_patch_size: 4
   qkv_bias: True
   qk_scale: None
-  drop_rate: 0.1
-  attn_drop_rate: 0.1
-  drop_path_rate: 0.1
+  drop_rate: 0.05
+  attn_drop_rate: 0.05
+  drop_path_rate: 0.05
   norm_skes_loss: True
 
 # training

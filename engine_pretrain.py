@@ -20,7 +20,7 @@ import util.lr_sched as lr_sched
 
 def train_one_epoch(model: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler,
+                    device: torch.device, epoch: int, loss_scaler, epochs: int,
                     log_writer=None,
                     args=None):
     model.train(True)
@@ -30,7 +30,21 @@ def train_one_epoch(model: torch.nn.Module,
     print_freq = 20
 
     accum_iter = args.accum_iter
+    ema_start = 0.995  # Starting EMA momentum, e.g., 0.996
+    ema_end = 1    # Ending EMA momentum, e.g., 1.0
+    num_epochs = epochs
+    ipe_scale = 1  # Scaling factor if needed
+    ipe = len(data_loader)      # Iterations per epoch
+    if num_epochs == 0:
+        raise ValueError("num_epochs should be larger than 0")
+    if ipe == 0:
+        raise ValueError("ipe should be larger than 0")
+    
+    total_steps = int(ipe * num_epochs * ipe_scale)
 
+    # Initialize the momentum scheduler
+    momentum_list = [ema_start + i * (ema_end - ema_start) / total_steps for i in range(total_steps + 1)]
+    momentum_scheduler = iter(momentum_list)
     optimizer.zero_grad()
 
     if log_writer is not None:
@@ -57,9 +71,18 @@ def train_one_epoch(model: torch.nn.Module,
             sys.exit(11)
 
         loss /= accum_iter
-        loss_scaler(loss, optimizer, parameters=model.parameters(),
+        loss_scaler(loss, optimizer, parameters=filter(lambda p: p.requires_grad, model.parameters()),
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
         if (data_iter_step + 1) % accum_iter == 0:
+            # EMA 更新教师模型的参数
+            # Step 3. Momentum EMA update of target encoder
+            with torch.no_grad():
+                m = next(momentum_scheduler)
+                for param_q, param_k in zip(model.module.student.parameters(), model.module.teacher.parameters()):
+                    # Update target encoder parameters
+                    # param_k.data.mul_(m).add_(param_q.detach().data, alpha=1 - m)
+                    param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+
             optimizer.zero_grad()
 
         torch.cuda.synchronize()
