@@ -747,18 +747,18 @@ class Model(nn.Module):
         # decode teacher motion into original motion
         teacher_orginal_motion = self.decoder_pred(teacher_latent)
         # contrastive loss between student motion and original motion
-        lambda2 = 0.0
+        lambda2 = 0.05
         contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
 
         recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
 
         # EMA update for teacher encoder
-        with torch.no_grad():
-            student_params = dict(self.student.named_parameters())
-            teacher_params = dict(self.teacher.named_parameters())
-            for name in student_params:
-                if name in teacher_params:
-                    teacher_params[name].data.mul_(ema_decay).add_(student_params[name].data * (1 - ema_decay))
+        # with torch.no_grad():
+        #     student_params = dict(self.student.named_parameters())
+        #     teacher_params = dict(self.teacher.named_parameters())
+        #     for name in student_params:
+        #         if name in teacher_params:
+        #             teacher_params[name].data.mul_(ema_decay).add_(student_params[name].data * (1 - ema_decay))
         return recon_loss
     
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
@@ -781,7 +781,7 @@ class Model(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, parent, dim_in=3, dim_feat=256, decoder_dim_feat=256,
+    def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
                  num_frames=120, num_joints=25, patch_size=1, t_patch_size=4,
                  qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
