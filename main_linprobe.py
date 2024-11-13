@@ -6,7 +6,7 @@
 # --------------------------------------------------------
 # References:
 # DeiT: https://github.com/facebookresearch/deit
-# BEiT: https://github.com/microsoft/unilm/tree/master/beit
+# MoCo v3: https://github.com/facebookresearch/moco-v3
 # --------------------------------------------------------
 
 import argparse
@@ -23,21 +23,20 @@ import random
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+# import torchvision.transforms as transforms
+# import torchvision.datasets as datasets
 
 import timm
 
 assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
-from timm.data.mixup import Mixup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
-import util.lr_decay as lrd
 import util.misc as misc
-from util.datasets import build_dataset
 from util.pos_embed import interpolate_temp_embed
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
+from util.lars import LARS
 
-from engine_finetune import train_one_epoch, evaluate
+from engine_linprobe import train_one_epoch, evaluate
 
 
 def import_class(name):
@@ -49,60 +48,37 @@ def import_class(name):
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('MAE fine-tuning for image classification', add_help=False)
+    parser = argparse.ArgumentParser('MAE linear probing for image classification', add_help=False)
     parser.add_argument('--config', default='./config/ntu60_xsub_joint_linear_debug.yaml', help='path to the configuration file')
+
+    parser.add_argument('--batch_size', default=512, type=int,
+                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
+    parser.add_argument('--epochs', default=90, type=int)
+    parser.add_argument('--accum_iter', default=1, type=int,
+                        help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
     # Model parameters
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--model_args', default=dict(), help='the arguments of model')
-    parser.add_argument('--drop_path', type=float, default=0.1, metavar='PCT',
-                        help='Drop path rate (default: 0.1)')
+
 
     # Optimizer parameters
-    parser.add_argument('--batch_size', default=64, type=int,
-                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=50, type=int)
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
-    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N', help='epochs to warmup LR')
-    parser.add_argument('--accum_iter', default=1, type=int,
-                        help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
-
     parser.add_argument('--enable_amp', action='store_true', default=False,
                         help='Enabling automatic mixed precision')
-    parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
-                        help='Clip gradient norm (default: None, no clipping)')
-    parser.add_argument('--weight_decay', type=float, default=0.05,
-                        help='weight decay (default: 0.05)')
+    parser.add_argument('--weight_decay', type=float, default=0,
+                        help='weight decay (default: 0 for linear probe following MoCo v1)')
 
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
-    parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
+    parser.add_argument('--blr', type=float, default=0.1, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
-    parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR',
+
+    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
-    parser.add_argument('--layer_decay', type=float, default=0.75,
-                        help='layer-wise lr decay from ELECTRA/BEiT')
 
-    # # Augmentation parameters
-    # parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1', metavar='NAME',
-    #                     help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)'),
-    parser.add_argument('--smoothing', type=float, default=0.1,
-                        help='Label smoothing (default: 0.1)')
-
-    # * Mixup params
-    parser.add_argument('--mixup', type=float, default=0,
-                        help='mixup alpha, mixup enabled if > 0.')
-    parser.add_argument('--cutmix', type=float, default=0,
-                        help='cutmix alpha, cutmix enabled if > 0.')
-    parser.add_argument('--cutmix_minmax', type=float, nargs='+', default=None,
-                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
-    parser.add_argument('--mixup_prob', type=float, default=1.0,
-                        help='Probability of performing mixup or cutmix when either/both is enabled')
-    parser.add_argument('--mixup_switch_prob', type=float, default=0.5,
-                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
-    parser.add_argument('--mixup_mode', type=str, default='batch',
-                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
+    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
+                        help='epochs to warmup LR')
 
     # * Finetuning params
     parser.add_argument('--finetune', default='',
@@ -113,12 +89,9 @@ def get_args_parser():
     parser.add_argument('--train_feeder_args', default=dict(), help='the arguments of data loader for training')
     parser.add_argument('--val_feeder_args', default=dict(), help='the arguments of data loader for validation')
 
-
-    parser.add_argument('--nb_classes', default=1000, type=int,
-                        help='number of the classification types')
-    parser.add_argument('--output_dir', default='./output_dir',
+    parser.add_argument('--output_dir', default='./linear_output_dir',
                         help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='./output_dir',
+    parser.add_argument('--log_dir', default='./linear_output_dir',
                         help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -126,6 +99,8 @@ def get_args_parser():
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
 
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
+                        help='start epoch')
     parser.add_argument('--eval', action='store_true',
                         help='Perform evaluation only')
     parser.add_argument('--dist_eval', action='store_true', default=False,
@@ -161,7 +136,7 @@ def main(args):
     np.random.seed(seed)
 
     cudnn.benchmark = True
-    
+
     # Load dataset
     Feeder = import_class(args.feeder)
     dataset_train = Feeder(**args.train_feeder_args)
@@ -218,65 +193,48 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=False
     )
-
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
     
     # define the model
     Model = import_class(args.model)
     model = Model(**args.model_args)
-    args.eval=False
-    print("arg.fineturn = %s" % str(args.finetune))
+    # if args.protocol == 'linprobe':
+    #     for name, param in model.named_parameters():
+    #         if not name.startswith('head'):
+    #             param.requires_grad = False
+
     if args.finetune and not args.eval:
-        # if args.finetune and not args.eval:
-    # 加载预训练模型
         checkpoint = torch.load(args.finetune, map_location='cpu')
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
+        state_dict = model.state_dict()
+        for k in ['head.fc.weight', 'head.fc.bias']:
+            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                print(f"Removing key {k} from pretrained checkpoint")
+                del checkpoint_model[k]
 
-        # 移除分类头参数，如果形状不匹配
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and k in model.state_dict():
-                if checkpoint_model[k].shape != model.state_dict()[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint due to shape mismatch.")
-                    del checkpoint_model[k]
-
-      
+        # interpolate position embedding
         interpolate_temp_embed(model, checkpoint_model)
 
-        
-        teacher_state_dict = {}
-        teacher_keys = ['joints_embed', 'blocks', 'norm', 'temp_embed', 'pos_embed']
-        for k, v in checkpoint_model.items():
-            if any(k.startswith(prefix) for prefix in teacher_keys):
-                
-                teacher_state_dict[k] = v
+        # load pre-trained model
+        msg = model.load_state_dict(checkpoint_model, strict=False)
+        print(msg)
 
-        teacher_msg = model.teacher.load_state_dict(teacher_state_dict, strict=False)
-        print(teacher_msg)
+        if set(msg.missing_keys) != {'head.fc.weight', 'head.fc.bias'}:
+            print(f"Warning: Missing keys - {msg.missing_keys}")
 
-        missing_keys_check_passed = True
-        for k in set(teacher_msg.missing_keys):
-            print(f"Missing key in teacher: {k}")
-            missing_keys_check_passed = False
-        assert missing_keys_check_passed, "needs more keys"
-        
-        model = model.to(device)
-        if model.teacher is not None:
-            model.teacher = model.teacher.to(device)
-            print("Teacher model loaded and moved to device.")
-        else:
-            print("No teacher model found in the model.")
+        # manually initialize fc layer: following MoCo v3
+        trunc_normal_(model.head.fc.weight, std=0.01)
 
-        print("Model and teacher model loaded successfully.")
-
+    # for linear prob only
+    # hack: revise model's fc with BN
+    model.head.fc = torch.nn.Sequential(torch.nn.BatchNorm1d(model.head.fc.in_features, affine=False, eps=1e-6), model.head.fc)
+    
+    # freeze all but the fc
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+    for _, p in model.head.named_parameters():
+        p.requires_grad = True
 
     model.to(device)
 
@@ -298,33 +256,15 @@ def main(args):
     print("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
-        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
-    # build optimizer with layer-wise lr decay (lrd)
-    param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
-        layer_decay=args.layer_decay
-    )
+    optimizer = torch.optim.SGD(model_without_ddp.head.parameters(), lr=args.lr, momentum=0.9, weight_decay=0)
+    print(optimizer)
     
-    # optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, eps=1e-8)
-
-
     loss_scaler = NativeScaler()
-    # for param_group in optimizer.param_groups:
-    #     required_keys = ['params', 'lr', 'betas', 'weight_decay']
-    #     for key in required_keys:
-    #         if key not in param_group:
-    #             print(f"Warning: '{key}' not found in optimizer param_group.")
 
-    if mixup_fn is not None:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing > 0.:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss()
 
     print("criterion = %s" % str(criterion))
 
@@ -344,12 +284,12 @@ def main(args):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
-            args.clip_grad, mixup_fn,
+            max_norm=None,
             log_writer=log_writer,
             args=args
         )
         if args.output_dir:
-            misc.save_model2(
+            misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 

@@ -280,10 +280,13 @@ class Transformer(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         # --------------------------------------------------------------------------
-        self.teacher = Encoder(dim_in=dim_in, dim_feat=dim_feat, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                               num_frames=num_frames, num_joints=num_joints, patch_size=patch_size, t_patch_size=t_patch_size,
-                               qkv_bias=qkv_bias, qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
-                               drop_path_rate=drop_path_rate, norm_layer=norm_layer, is_teacher=True, protocol=protocol)
+    #     self.teacher = None
+    #     self.set_teacher()
+    # def set_teacher(self):
+    #     if self.teacher is None:
+    #         self.teacher = self.Teacher(self)
+    #     return self.teacher
+        self.teacher = Encoder(is_teacher=True)
         self.student = None
 
     def _init_weights(self, m):
@@ -295,6 +298,34 @@ class Transformer(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+
+    # def forward(self, x):
+    #     N, C, T, V, M = x.shape
+    #     x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
+
+    #     # embed skeletons
+    #     x = self.joints_embed(x)
+
+    #     NM, TP, VP, _ = x.shape
+
+    #     # add pos & temp embed
+    #     x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
+
+    #     # masking: length -> length * mask_ratio
+    #     x = x.reshape(NM, TP * VP, -1)
+
+    #     # apply Transformer blocks
+    #     for idx, blk in enumerate(self.blocks):
+    #         x = blk(x)
+
+    #     x = self.norm(x)
+
+    #     x = x.reshape(N, M, TP, VP, -1)
+
+    #     x = self.head(x)
+ 
+    #     return x
     def forward(self, x):
         N, C, T, V, M = x.shape
         x2 = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
@@ -316,7 +347,7 @@ class Encoder(nn.Module):
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
                  num_frames=120, num_joints=25, patch_size=1, t_patch_size=4,
                  qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, norm_skes_loss=False,mask_ratio=0.0, motion_aware_tau=0.0,is_teacher=True,protocol='linprobe'):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, norm_skes_loss=False,mask_ratio=0.0, motion_aware_tau=0.0,is_teacher=True):
         super().__init__()
         # MAE decoder specifics
         self.joints_embed = SkeleEmbed(dim_in, dim_feat, num_frames, num_joints, patch_size, t_patch_size)
@@ -342,19 +373,15 @@ class Encoder(nn.Module):
         self.is_teacher = is_teacher
         # Initialize weights
         self.apply(self.init_weights)
-        self.protocol=protocol
         # Make teacher parameters not trainable
         if self.is_teacher:
+            for param in self.parameters():
+                param.requires_grad = False
             self.mask_ratio = 0.0
             self.motion_aware_tau = 0.0
-        if self.protocol =='finetune':
-            for param in self.parameters():
-                param.requires_grad = True
-        elif self.protocol == 'linprobe':
-            for param in self.parameters():
-                param.requires_grad = True
         else:
-            raise TypeError('Unrecognized evaluation protocol!')
+            for param in self.parameters():
+                param.requires_grad = True
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
             # we use xavier_uniform following official JAX ViT:
@@ -381,6 +408,76 @@ class Encoder(nn.Module):
         x = x.reshape(shape=(NM, TP * VP, u * p * C))
         return x
 
+    # def motion_aware_random_masking(self, x, x_orig, mask_ratio, tau):
+    #     """
+    #     Perform per-sample random masking by per-sample shuffling.
+    #     Per-sample shuffling is done by argsort random noise.
+    #     x: [NM, L, D], sequence
+    #     x_orig: patchified original skeleton sequence
+    #     """
+    #     NM, L, D = x.shape  # batch, length, dim
+    #     _, TP, VP, _ = x_orig.shape
+            
+    #     len_keep = int(L * (1 - mask_ratio))
+
+    #     x_orig_motion = torch.zeros_like(x_orig)
+    #     x_orig_motion[:, 1:, :, :] = torch.abs(x_orig[:, 1:, :, :] - x_orig[:, :-1, :, :])
+    #     x_orig_motion[:, 0, :, :] = x_orig_motion[:, 1, :, :]
+    #     x_orig_motion = x_orig_motion.mean(dim=[3])  # NM, TP, VP
+    #     x_orig_motion = x_orig_motion.reshape(NM, L)
+
+    #     x_orig_motion = x_orig_motion / (torch.max(x_orig_motion, dim=-1, keepdim=True).values * tau + 1e-10)
+    #     x_orig_motion_prob = F.softmax(x_orig_motion, dim=-1)
+
+    #     noise = torch.log(x_orig_motion_prob) - torch.log(-torch.log(torch.rand(NM, L, device=x.device) + 1e-10) + 1e-10)  # Gumbel noise
+
+    #     # sort noise for each sample
+    #     ids_shuffle = torch.argsort(
+    #         noise, dim=1
+    #     )  # ascend: small is keep, large is remove
+    #     ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    #     # keep the first subset
+    #     ids_keep = ids_shuffle[:, :len_keep]
+    #     x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+    #     # generate the binary mask: 0 is keep, 1 is remove
+    #     mask = torch.ones([NM, L], device=x.device)
+    #     mask[:, :len_keep] = 0
+    #     # unshuffle to get the binary mask
+    #     mask = torch.gather(mask, dim=1, index=ids_restore)
+
+    #     return x_masked, mask, ids_restore, ids_keep
+
+    # def random_masking(self, x, mask_ratio):
+    #     """
+    #     Perform per-sample random masking by per-sample shuffling.
+    #     Per-sample shuffling is done by argsort random noise.
+    #     x: [N, L, D], sequence
+    #     """
+    #     N, L, D = x.shape  # batch, length, dim
+    #     len_keep = int(L * (1 - mask_ratio))
+
+    #     noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+    #     # sort noise for each sample
+    #     ids_shuffle = torch.argsort(
+    #         noise, dim=1
+    #     )  # ascend: small is keep, large is remove
+    #     ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    #     # keep the first subset
+    #     ids_keep = ids_shuffle[:, :len_keep]
+    #     x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+    #     # generate the binary mask: 0 is keep, 1 is remove
+    #     mask = torch.ones([N, L], device=x.device)
+    #     mask[:, :len_keep] = 0
+    #     # unshuffle to get the binary mask
+    #     mask = torch.gather(mask, dim=1, index=ids_restore)
+
+    #     return x_masked, mask, ids_restore, ids_keep
+
     def forward_encoder(self,x, mask_ratio, motion_aware_tau):
         
         # x_orig = self.patchify(x)
@@ -393,7 +490,15 @@ class Encoder(nn.Module):
         # add pos & temp embed
         x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
 
+        # masking: length -> length * mask_ratio
         x = x.reshape(NM, TP * VP, -1)
+        # if motion_aware_tau > 0:
+        #     x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
+        #     x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+        # else:   
+        #     x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+
+        # apply Transformer blocks
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
 
@@ -402,14 +507,8 @@ class Encoder(nn.Module):
         return x
 
     def forward(self, x, mask_ratio=0.0, motion_aware_tau=0.0):
-        if self.protocol == 'linprobe':
+        if self.is_teacher:
             with torch.no_grad():
                 return self.forward_encoder(x, mask_ratio, motion_aware_tau)
         else:
             return self.forward_encoder(x, mask_ratio, motion_aware_tau)
-
-        # if self.is_teacher:
-        #     with torch.no_grad():
-        #         return self.forward_encoder(x, mask_ratio, motion_aware_tau)
-        # else:
-        #     return self.forward_encoder(x, mask_ratio, motion_aware_tau)

@@ -46,7 +46,7 @@ model_args:
 # training
 epochs: 250
 warmup_epochs: 5
-batch_size: 24
+batch_size: 64
 lr: 5e-4
 layer_decay: 0.8
 smoothing: 0.1

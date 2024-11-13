@@ -747,8 +747,11 @@ class Model(nn.Module):
         # decode teacher motion into original motion
         teacher_orginal_motion = self.decoder_pred(teacher_latent)
         # contrastive loss between student motion and original motion
-        lambda2 = 0.05
+        lambda2 = 0.1
         contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
+        # contrasive loss between teacher motion and original motion
+        # contrastive_loss_original = F.mse_loss(target, teacher_orginal_motion, reduction='none')
+
 
         recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
 

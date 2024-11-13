@@ -30,17 +30,17 @@ model_args:
   t_patch_size: 4
   qkv_bias: True
   qk_scale: None
-  drop_rate: 0.
-  attn_drop_rate: 0.
-  drop_path_rate: 0.
+  drop_rate: 0.0
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.0
   norm_skes_loss: True
 
 # training
-epochs: 800
+epochs: 1200
 warmup_epochs: 20
-batch_size: 32
+batch_size: 64
 lr: 1e-3
-min_lr: 5e-4
+min_lr: 2e-5
 weight_decay: 0.05
 mask_ratio: 0.9
 motion_aware_tau: 0.80
