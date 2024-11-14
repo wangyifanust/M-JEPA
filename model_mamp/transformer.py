@@ -727,9 +727,9 @@ class Model(nn.Module):
             x = blk(x)
 
         x = self.decoder_norm(x)
-        # print('student_latent1', x.shape)
+        print('student_latent1', x.shape)
         x = self.decoder_pred(x)
-        # print('student_latent2', x.shape)
+        print('student_latent2', x.shape)
         return x
     # In the forward or target generation logic
     def generate_normalized_teacher_targets(self, teacher_latents):
@@ -767,10 +767,10 @@ class Model(nn.Module):
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
         # contrastive loss between student latent after prediction and teacher latent
         # print('student_latent', student_latent.shape)
-        recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
+        recon_loss_latent = F.smooth_l1_loss(student_latent, teacher_latent, reduction='none')
         # print('recon_loss_latent', recon_loss_latent.shape)
         # print('mask', mask.shape)
-        recon_loss = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
+        recon_loss = (recon_loss_latent.mean(dim=-1) * mask).sum() /  (mask.sum() + 1e-8)
         # decode student motion into original motion 
         # student_orginal_motion = self.decoder_pred(student_latent)
         
