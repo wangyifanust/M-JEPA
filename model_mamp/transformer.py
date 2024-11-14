@@ -607,7 +607,7 @@ class Transformer(nn.Module):
 #   self.student = encoder()
 #   self.teacher = encoder() or copy.deepcopy(self.student)
 #   self.predictor = predictor() // decoder it is in the model class
-
+from torch.nn import InstanceNorm1d
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
@@ -659,11 +659,12 @@ class Model(nn.Module):
 
         self.decoder_pred = nn.Linear(
             decoder_dim_feat,
-            t_patch_size * patch_size * dim_in,
+            dim_feat,
             bias=True
         ) # decoder to patch
 
         # Initialize weights
+        self.instance_norm = InstanceNorm1d(dim_feat,affine=False)
 
         self.apply(self._init_weights)
         self.teacher = Encoder(is_teacher=True)
@@ -726,15 +727,52 @@ class Model(nn.Module):
             x = blk(x)
 
         x = self.decoder_norm(x)
+        # print('student_latent1', x.shape)
+        x = self.decoder_pred(x)
+        # print('student_latent2', x.shape)
         return x
+    # In the forward or target generation logic
+    def generate_normalized_teacher_targets(self, teacher_latents):
+        """
+        Applies instance normalization followed by averaging and layer normalization
+        to the teacher latent outputs from each FFN layer.
+        """
+        # Assuming teacher_latents is a list of layer-wise outputs [Z_1^T, Z_2^T, ..., Z_Le^T]
+        normalized_outputs = []
+
+        for latent in teacher_latents:
+            # Handle different shapes of latent to ensure compatibility
+            if latent.ndim != 3:
+                raise ValueError(f"Expected latent to have 3 dimensions, but got {latent.ndim} dimensions.")
+
+            # Apply Instance Normalization (assuming latent has shape [N, L, C])
+            latent = latent.permute(0, 2, 1)  # Convert to shape [N, C, L] for InstanceNorm1d
+            latent_in = self.instance_norm(latent)
+            latent_in = latent_in.permute(0, 2, 1)  # Convert back to shape [N, L, C]
+            normalized_outputs.append(latent_in)
+
+        # Print the shape of the first normalized output for debugging purposes
+        # if normalized_outputs:
+        #     print('teacher_latent2', normalized_outputs[0].shape)
+
+        # Average normalized features across layers
+        Y_prime = torch.mean(torch.stack(normalized_outputs), dim=0)  # Average across layers
+        # print('teacher_latent3', Y_prime.shape)
+
+        # Apply Layer Normalization
+        Y = self.norm(Y_prime)  # Assuming `self.norm` is an instance of `nn.LayerNorm`
+        return Y
+
 
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
         # contrastive loss between student latent after prediction and teacher latent
+        # print('student_latent', student_latent.shape)
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
-        
-        recon_loss_latent = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
+        # print('recon_loss_latent', recon_loss_latent.shape)
+        # print('mask', mask.shape)
+        recon_loss = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
         # decode student motion into original motion 
-        student_orginal_motion = self.decoder_pred(student_latent)
+        # student_orginal_motion = self.decoder_pred(student_latent)
         
         # original motion from target
         target = self.patchify(target) # [NM, TP * VP, C]
@@ -745,15 +783,15 @@ class Model(nn.Module):
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.0e-6) ** 0.5
         # decode teacher motion into original motion
-        teacher_orginal_motion = self.decoder_pred(teacher_latent)
+        # teacher_orginal_motion = self.decoder_pred(teacher_latent)
         # contrastive loss between student motion and original motion
-        lambda2 = 0.1
-        contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
+        # lambda2 = 0.0
+        # contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
         # contrasive loss between teacher motion and original motion
         # contrastive_loss_original = F.mse_loss(target, teacher_orginal_motion, reduction='none')
 
 
-        recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
+        # recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
 
         # EMA update for teacher encoder
         # with torch.no_grad():
@@ -772,15 +810,20 @@ class Model(nn.Module):
         # x_embed = self.joints_embed(x)
         # get teacher latent from teacher encoder
         teacher_latent, maskteacher, ids_restoreteacher = self.teacher(x,mask_ratio=0.0, motion_aware_tau=0.0)
+        # print('teacher_latent1',teacher_latent.shape)
+        teacher_latent = self.generate_normalized_teacher_targets(teacher_latent)
         # get student latent from student encoder after masking
+        # print('teacher_latent4',teacher_latent.shape)
         student_latent, mask, ids_restore= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
         # predict student latent using predictor
-        student_latent_predicted = self.predictor(student_latent, ids_restore)
+        student_latent = self.predictor(student_latent, ids_restore)
+        
+        # print('student_latent', student_latent.shape)
         # print('student_latent_predicted ', student_latent_predicted .shape)
         # print('teacher_latent', teacher_latent.shape)
-        loss = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
+        loss = self.forward_loss(student_latent, teacher_latent, x_motion, mask, ids_restore)
         
-        return loss, student_latent_predicted, mask
+        return loss, student_latent, mask
 
 
 class Encoder(nn.Module):
@@ -940,12 +983,24 @@ class Encoder(nn.Module):
             x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
 
         # apply Transformer blocks
-        for idx, blk in enumerate(self.blocks):
-            x = blk(x)
+        
+        if self.is_teacher:
+            latent=[]
+            for idx, blk in enumerate(self.blocks):
+                x = blk(x)
+                latent.append(x)
 
-        x = self.norm(x)
+            x = self.norm(x)
+            latent.append(x)
+            latent = torch.stack(latent)
+            # print('latent', latent.shape)
+            return latent, mask, ids_restore
+        else:
+            for idx, blk in enumerate(self.blocks):
+                x = blk(x)
 
-        return x, mask, ids_restore
+            x = self.norm(x)
+            return x, mask, ids_restore
 
     def forward(self, x, mask_ratio=0.0, motion_aware_tau=0.0):
         if self.is_teacher:
