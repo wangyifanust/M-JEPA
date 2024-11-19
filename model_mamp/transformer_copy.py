@@ -608,26 +608,6 @@ class Transformer(nn.Module):
 #   self.student = encoder()
 #   self.teacher = encoder() or copy.deepcopy(self.student)
 #   self.predictor = predictor() // decoder it is in the model class
-# class MLP(nn.Module):
-#     def __init__(self, input_dim, output_dim, hidden_dim, num_layers=2):
-#         super(MLP, self).__init__()
-#         layers = []
-#         # 添加输入层
-#         layers.append(nn.Linear(input_dim, hidden_dim))
-#         layers.append(nn.ReLU())  # 你可以选择其他激活函数
-
-#         # 添加中间隐藏层
-#         for _ in range(num_layers - 2):
-#             layers.append(nn.Linear(hidden_dim, hidden_dim))
-#             layers.append(nn.ReLU())
-
-#         # 添加输出层
-#         layers.append(nn.Linear(hidden_dim, output_dim))
-#         self.mlp = nn.Sequential(*layers)
-
-#     def forward(self, x):
-#         return self.mlp(x)
-
 from torch.nn import InstanceNorm1d
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
@@ -684,17 +664,6 @@ class Model(nn.Module):
             decoder_dim_feat,
             bias=True
         ) # decoder to patch
-        # self.decoder_pred_recon = MLP(
-        #     input_dim=decoder_dim_feat,
-        #     output_dim=t_patch_size * patch_size * dim_in,
-        #     hidden_dim=256,  
-        #     num_layers=3  
-        # )
-        self.decoder_pred_recon = nn.Linear(
-            decoder_dim_feat,
-            t_patch_size * patch_size * dim_in,
-            bias=True
-        )
 
         # Initialize weights
         self.instance_norm = InstanceNorm1d(dim_feat,affine=False)
@@ -768,11 +737,9 @@ class Model(nn.Module):
             predict_latent.append(x)
 
         x = self.decoder_norm(x)
-        # predict_latent.append(x)
+
         predict_latent = torch.stack(predict_latent)
-        # print('student_latent1', x.shape)
-        # x = self.decoder_pred(x)
-        # print('student_latent2', x.shape)
+        
         return predict_latent,x
     # In the forward or target generation logic
     def generate_normalized_teacher_targets(self, teacher_latents):
@@ -831,30 +798,10 @@ class Model(nn.Module):
 
 
 
-    def forward_loss(self, student_latent, student_orginal_motion, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
-        # contrastive loss between student latent after prediction and teacher latent
-        # print('student_latent', student_latent.shape)
-        # teacher_latent=self.decoder_pred(teacher_latent)
-        # student_latent = self.decoder_pred(student_latent)
-        # mask = mask.unsqueeze(-1)
-        # teacher_latent = teacher_latent * mask
-        # student_latent = student_latent * mask
-        # epsilon = 1e-8  # 小的扰动值
-        # student_latent = student_latent + epsilon * (student_latent.norm(dim=-1, keepdim=True) == 0).float()
-        # teacher_latent = teacher_latent + epsilon * (teacher_latent.norm(dim=-1, keepdim=True) == 0).float()
-
-
-        # cossim = nn.CosineSimilarity(dim=1, eps=1e-6)
-        # recon_loss = 1 - cossim(student_latent, teacher_latent)
-        # recon_loss = recon_loss.mean()
-
+    def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
-        # print('recon_loss_latent', recon_loss_latent.shape)
-        # print('mask', mask.shape)
-        # recon_loss_latent = F.smooth_l1_loss(student_latent, teacher_latent, reduction='none')
+    
         recon_loss = (recon_loss_latent.mean(dim=-1) * mask).sum() /  (mask.sum() + 1e-8)
-        # decode student motion into original motion 
-        # student_latent = self.decoder_pred(student_latent)
         
         # original motion from target
         target = self.patchify(target) # [NM, TP * VP, C]
@@ -867,18 +814,9 @@ class Model(nn.Module):
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.0e-6) ** 0.5
-        # decode teacher motion into original motion
-        # teacher_orginal_motion = self.decoder_pred(teacher_latent)
-        # contrastive loss between student motion and original motion
-        lambda2 = 1.00
-        contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
-        # recon_loss = recon_loss + lambda2 * contrastive_loss_original.mean()
-        # contrasive loss between teacher motion and original motion
-        # contrastive_loss_original = F.mse_loss(target, teacher_orginal_motion, reduction='none')
+        
+        lambda2 = 0.0
 
-
-        # recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
-        recon_loss = recon_loss + lambda2 * contrastive_loss_original.mean()
     
         return recon_loss
     
@@ -890,25 +828,16 @@ class Model(nn.Module):
         # x_embed = self.joints_embed(x)
         # get teacher latent from teacher encoder
         teacher_latent,teacher_latent2, maskteacher, ids_restoreteacher = self.teacher(x,mask_ratio=0.0, motion_aware_tau=0.0)
-        # print('teacher_latent1',teacher_latent.shape)
+       
         # teacher_latent = self.generate_normalized_teacher_targets(teacher_latent2)
-        # get student latent from student encoder after masking
-        # print('teacher_latent4',teacher_latent.shape)
-        # print('mask_ratio', mask_ratio)
-        # print('motion_aware_tau', motion_aware_tau)
-        student_latent, student_latent2, mask, ids_restore= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
-        # predict student latent using predictor
-        # print('mask', mask.shape)
-        # print('student_latent', student_latent.shape)
+        
+        student_latent, student_latent2,mask, ids_restore= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
+      
         student_latent, student_latent2 = self.predictor(student_latent, ids_restore)
 
         student_latent = self.decoder_pred(student_latent2)
-        student_orginal_motion = self.decoder_pred_recon(student_latent2)
-        # student_latent= self.generate_normalized_student_targets(student_latent)
-        # print('student_latent', student_latent.shape)
-        # print('student_latent_predicted ', student_latent.shape)
-        # print('teacher_latent', teacher_latent.shape)
-        loss = self.forward_loss(student_latent,student_orginal_motion, teacher_latent, x_motion, mask, ids_restore)
+        
+        loss = self.forward_loss(student_latent, teacher_latent, x_motion, mask, ids_restore)
         
         return loss, student_latent, mask
 
