@@ -642,7 +642,7 @@ class Model(nn.Module):
         self.num_joints = num_joints
         self.patch_size = patch_size
         self.t_patch_size = t_patch_size
-
+        self.drop_rate = drop_rate  
         self.norm_skes_loss = norm_skes_loss
         
         # MAE Encoder specifics
@@ -691,16 +691,16 @@ class Model(nn.Module):
             bias=True
         )
         self.decoder_pred_recon_mlp = MLP(
-            input_dim=decoder_dim_feat,
-            output_dim=t_patch_size * patch_size * dim_in,
-            hidden_dim=256,  
-            num_layers=3  
+            in_features=decoder_dim_feat,
+            out_features=t_patch_size * patch_size * dim_in,
+            hidden_features=256,
+            drop=self.drop_rate  
         )
         self.decoder_pred_mlp = MLP(
-            input_dim=decoder_dim_feat,
-            output_dim=decoder_dim_feat,
-            hidden_dim=256,  
-            num_layers=3  
+            in_features=decoder_dim_feat,
+            out_features=decoder_dim_feat,
+            hidden_features=256,
+            drop=self.drop_rate
         )
 
         # Initialize weights
@@ -1013,7 +1013,7 @@ class Encoder(nn.Module):
 
         x_orig_motion = x_orig_motion / (torch.max(x_orig_motion, dim=-1, keepdim=True).values * tau + 1e-10)
         x_orig_motion_prob = F.softmax(x_orig_motion, dim=-1)
-        print('x_orig_motion_prob', x_orig_motion_prob.shape)
+        # print('x_orig_motion_prob', x_orig_motion_prob.shape)
         noise = torch.log(x_orig_motion_prob) - torch.log(-torch.log(torch.rand(NM, L, device=x.device) + 1e-10) + 1e-10)  # Gumbel noise
 
         # sort noise for each sample
@@ -1024,9 +1024,9 @@ class Encoder(nn.Module):
 
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
-        print('x1', x.shape)
+        # print('x1', x.shape)
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        print('x2', x_masked.shape)
+        # print('x2', x_masked.shape)
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([NM, L], device=x.device)
@@ -1083,9 +1083,9 @@ class Encoder(nn.Module):
         if self.is_teacher==False:
             if motion_aware_tau > 0:
                 x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
-                print('x_orig', x_orig.shape)
+                # print('x_orig', x_orig.shape)
                 x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
-                print('x', x.shape)
+                # print('x', x.shape)
             else:   
                 x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
         else:
