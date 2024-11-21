@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+# assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
@@ -205,8 +205,9 @@ def main(args):
     
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    # param_groups = optim_factory.add_weight_decay(filter(lambda p: p.requires_grad, model_without_ddp.parameters()), args.weight_decay)
     # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model_without_ddp.parameters()), lr=args.lr, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
 
     print(optimizer)
     loss_scaler = NativeScaler()
@@ -245,8 +246,10 @@ def main(args):
 
 if __name__ == '__main__':
     parser = get_args_parser()
-    
+    import os
+    local_rank = int(os.environ['LOCAL_RANK'])
     p = parser.parse_args()
+    p.local_rank = local_rank
     if p.config is not None:
         with open(p.config, 'r') as f:
             default_args = yaml.load(f, yaml.FullLoader)

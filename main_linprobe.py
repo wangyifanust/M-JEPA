@@ -28,7 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
+# assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
 
 import util.misc as misc
@@ -202,6 +202,7 @@ def main(args):
     #         if not name.startswith('head'):
     #             param.requires_grad = False
 
+    
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu')
 
@@ -220,11 +221,11 @@ def main(args):
         msg = model.load_state_dict(checkpoint_model, strict=False)
         print(msg)
 
-        if set(msg.missing_keys) != {'head.fc.weight', 'head.fc.bias'}:
-            print(f"Warning: Missing keys - {msg.missing_keys}")
+        assert set(msg.missing_keys) == {'head.fc.weight', 'head.fc.bias'}
 
         # manually initialize fc layer: following MoCo v3
         trunc_normal_(model.head.fc.weight, std=0.01)
+
 
     # for linear prob only
     # hack: revise model's fc with BN

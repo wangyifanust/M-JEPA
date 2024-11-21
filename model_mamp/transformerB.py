@@ -702,6 +702,12 @@ class Model(nn.Module):
             hidden_features=256,
             drop=self.drop_rate
         )
+        self.teacher_mlp = MLP(
+            in_features=decoder_dim_feat,
+            out_features=decoder_dim_feat,
+            hidden_features=256,
+            drop=self.drop_rate
+        )
 
         # Initialize weights
         self.instance_norm = InstanceNorm1d(dim_feat,affine=False)
@@ -758,10 +764,10 @@ class Model(nn.Module):
         x = self.decoder_embed(x)
         C = x.shape[-1]
         # append intra mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
-        x_ = torch.cat([x, mask_tokens], dim=1)# no cls token
-
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))# unshuffle
+        # mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
+        # x_ = torch.cat([x, mask_tokens], dim=1)# no cls token
+        x_ = x
+        # x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))# unshuffle
 
         x = x_.view([NM, TP, VP, C])
         # add pos & temp embed
@@ -854,7 +860,8 @@ class Model(nn.Module):
         # cossim = nn.CosineSimilarity(dim=1, eps=1e-6)
         # recon_loss = 1 - cossim(student_latent, teacher_latent)
         # recon_loss = recon_loss.mean()
-
+        student_latent = self.decoder_pred_mlp(student_latent)
+        teacher_latent = self.teacher_mlp(teacher_latent)
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
         # print('recon_loss_latent', recon_loss_latent.shape)
         # print('mask', mask.shape)
@@ -865,10 +872,10 @@ class Model(nn.Module):
         
         # original motion from target
         target = self.patchify(target) # [NM, TP * VP, C]
-        if recon_loss<0.0002:
-            print('teacher_latent', teacher_latent)
-            print('student_latent', student_latent)
-            raise ValueError('recon_loss is too low')
+        # if recon_loss<0.0002:
+        #     print('teacher_latent', teacher_latent)
+        #     print('student_latent', student_latent)
+        #     raise ValueError('recon_loss is too low')
 
         if self.norm_skes_loss:
             mean = target.mean(dim=-1, keepdim=True)
@@ -877,26 +884,15 @@ class Model(nn.Module):
         # decode teacher motion into original motion
         # teacher_orginal_motion = self.decoder_pred(teacher_latent)
         # contrastive loss between student motion and original motion
-        
-        # contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
-        loss=(student_orginal_motion-target)**2
-        contrastive_loss_original = loss.mean(dim=-1) * mask/ (mask.sum() + 1e-8)
-
+        lambda2 = 1.00
+        contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
         # recon_loss = recon_loss + lambda2 * contrastive_loss_original.mean()
         # contrasive loss between teacher motion and original motion
         # contrastive_loss_original = F.mse_loss(target, teacher_orginal_motion, reduction='none')
-        lambda_value = 0.5
-        recon_loss_weight = recon_loss / (contrastive_loss_original.mean() + 1e-8)
-        if recon_loss_weight > 1.0:
-            lambda_value *= 1.05  
-        else:
-            lambda_value *= 0.95  
 
-
-        lambda_value = max(min(lambda_value, 2.0), 0.1)
 
         # recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
-        recon_loss = recon_loss + lambda_value * contrastive_loss_original.mean()
+        recon_loss = recon_loss + lambda2 * contrastive_loss_original.mean()
     
         return recon_loss
     
@@ -918,21 +914,21 @@ class Model(nn.Module):
         # predict student latent using predictor
         # print('mask', mask.shape)
         # print('student_latent', student_latent.shape)
-        student_latent, student_latent2 = self.predictor(student_latent, ids_restore)
+        student_latent, student_latent2 = self.predictor(student_latent2, ids_restore)
 
         # Linear
         # student_latent = self.decoder_pred(student_latent2)
         # student_orginal_motion = self.decoder_pred_recon(student_latent2)
 
         # MLP
-        student_latent = self.decoder_pred_mlp(student_latent2)
+        # student_latent = self.decoder_pred_mlp(student_latent2)
         student_orginal_motion = self.decoder_pred_recon_mlp(student_latent2)
 
         # student_latent= self.generate_normalized_student_targets(student_latent)
         # print('student_latent', student_latent.shape)
         # print('student_latent_predicted ', student_latent.shape)
         # print('teacher_latent', teacher_latent.shape)
-        loss = self.forward_loss(student_latent,student_orginal_motion, teacher_latent, x_motion, mask, ids_restore)
+        loss = self.forward_loss(student_latent2,student_orginal_motion, teacher_latent, x_motion, mask, ids_restore)
         
         return loss, student_latent, mask
 
@@ -960,7 +956,7 @@ class Encoder(nn.Module):
         trunc_normal_(self.temp_embed, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
         # Copy the encoder components from the parent without sharing paramete
-        
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim_feat))
         self.patch_size = patch_size
         self.t_patch_size = t_patch_size
         self.mask_ratio = mask_ratio
@@ -1037,13 +1033,23 @@ class Encoder(nn.Module):
         ids_keep = ids_shuffle[:, :len_keep]
         # print('x1', x.shape)
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        # x_mask_tokens = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        mask_tokens = self.mask_token.repeat(NM, TP * VP - x_masked.shape[1], 1)
+        x_ = torch.cat([x_masked, mask_tokens], dim=1)# no cls token
+
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))
+
         # print('x2', x_masked.shape)
+        x_masked = x_
+        # print('x_masked', x_masked.shape)
 
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([NM, L], device=x.device)
         mask[:, :len_keep] = 0
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        # x_masked = x.clone()
 
         return x_masked, mask, ids_restore, ids_keep
 
@@ -1067,7 +1073,11 @@ class Encoder(nn.Module):
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-
+        mask_tokens = self.mask_token.repeat(N, L - x_masked.shape[1], 1)
+        x_ = torch.cat([x_masked, mask_tokens], dim=1)# no cls token
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))
+        x_masked = x_
+        
         # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0

@@ -52,7 +52,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast(enabled=args.enable_amp):
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=args.enable_amp):
             outputs = model(samples)
             loss = criterion(outputs, targets)
 

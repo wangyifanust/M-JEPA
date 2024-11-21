@@ -26,7 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
+# assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
 from timm.data.mixup import Mixup
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
@@ -234,39 +234,28 @@ def main(args):
     args.eval=False
     print("arg.fineturn = %s" % str(args.finetune))
     if args.finetune and not args.eval:
-        # if args.finetune and not args.eval:
-    # 加载预训练模型
         checkpoint = torch.load(args.finetune, map_location='cpu')
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
-
-        # 移除分类头参数，如果形状不匹配
+        state_dict = model.state_dict()
         for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and k in model.state_dict():
-                if checkpoint_model[k].shape != model.state_dict()[k].shape:
-                    print(f"Removing key {k} from pretrained checkpoint due to shape mismatch.")
-                    del checkpoint_model[k]
+            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                print(f"Removing key {k} from pretrained checkpoint")
+                del checkpoint_model[k]
 
-      
+        # interpolate position embedding
         interpolate_temp_embed(model, checkpoint_model)
 
-        
-        teacher_state_dict = {}
-        teacher_keys = ['joints_embed', 'blocks', 'norm', 'temp_embed', 'pos_embed']
-        for k, v in checkpoint_model.items():
-            if any(k.startswith(prefix) for prefix in teacher_keys):
-                
-                teacher_state_dict[k] = v
-
-        teacher_msg = model.teacher.load_state_dict(teacher_state_dict, strict=False)
-        print(teacher_msg)
+        # load pre-trained model
+        msg = model.load_state_dict(checkpoint_model, strict=False)
+        print(msg)
 
         missing_keys_check_passed = True
-        for k in set(teacher_msg.missing_keys):
-            print(f"Missing key in teacher: {k}")
-            missing_keys_check_passed = False
-        assert missing_keys_check_passed, "needs more keys"
+        for k in set(msg.missing_keys):
+            if ('head' not in k) and ('pre_logits' not in k):
+                missing_keys_check_passed = False
+        assert missing_keys_check_passed == True
         
         model = model.to(device)
         if model.teacher is not None:

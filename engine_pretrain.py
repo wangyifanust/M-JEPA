@@ -31,7 +31,7 @@ def train_one_epoch(model: torch.nn.Module,
 
     accum_iter = args.accum_iter
     ema_start = 0.999  # Starting EMA momentum, e.g., 0.996
-    ema_end = 1    # Ending EMA momentum, e.g., 1.0
+    ema_end = 0.9999    # Ending EMA momentum, e.g., 1.0
     num_epochs = epochs
     ipe_scale = 1  # Scaling factor if needed
     ipe = len(data_loader)      # Iterations per epoch
@@ -58,7 +58,7 @@ def train_one_epoch(model: torch.nn.Module,
 
         samples = samples.float().to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=args.enable_amp):
+        with torch.amp.autocast(device_type='cuda', enabled=args.enable_amp):
             loss, _, _ = model(samples,
                                mask_ratio=args.mask_ratio,
                                motion_stride=args.motion_stride,
@@ -77,7 +77,7 @@ def train_one_epoch(model: torch.nn.Module,
             # Step 3. Momentum EMA update of target encoder
             with torch.no_grad():
                 m = next(momentum_scheduler)
-                # m = 0.999
+                # m = 0.9999
                 for param_q, param_k in zip(model.module.student.parameters(), model.module.teacher.parameters()):
                     # Update target encoder parameters
                     # param_k.data.mul_(m).add_(param_q.detach().data, alpha=1 - m)
