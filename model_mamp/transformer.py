@@ -671,6 +671,12 @@ class Model(nn.Module):
                 dim=decoder_dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(decoder_depth)])
+        self.decoder_blocks2 = nn.ModuleList([
+            Block(
+                dim=decoder_dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(decoder_depth)])
+        self.decoder_norm2 = norm_layer(decoder_dim_feat)
         self.decoder_norm = norm_layer(decoder_dim_feat)
 
         self.decoder_temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, decoder_dim_feat))
@@ -746,6 +752,13 @@ class Model(nn.Module):
         x = imgs.reshape(shape=(NM, TP, u, VP, p, C))
         x = torch.einsum("ntuvpc->ntvupc", x)
         x = x.reshape(shape=(NM, TP * VP, u * p * C))
+        return x
+    def mask(self,x,mask,ids_keep):
+        # print('x1.shape',x.shape)
+        x = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+        # print('x2.shape',x.shape)
+        # x = x * mask.unsqueeze(-1)
+        # print('x3.shape',x.shape)
         return x
 
     def predictor(self, x, ids_restore):
@@ -836,7 +849,52 @@ class Model(nn.Module):
         return Y
         # return Y_prime
 
+    def decoder(self, x, ids_restore):
+        NM = x.shape[0]
+        TP = self.joints_embed.t_grid_size
+        VP = self.joints_embed.grid_size
 
+        # embed tokens
+        x = self.decoder_embed(x)
+        C = x.shape[-1]
+        # append intra mask tokens to sequence
+        mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
+        x_ = torch.cat([x, mask_tokens], dim=1)# no cls token
+
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))# unshuffle
+
+        x = x_.view([NM, TP, VP, C])
+        # add pos & temp embed
+        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
+        # apply Transformer blocks
+        x = x.reshape(NM, TP * VP, C)
+        for blk in self.decoder_blocks2:
+            x = blk(x)
+        x = self.decoder_norm2(x)
+        return x
+    def decoder2(self, x, ids_restore):
+        NM = x.shape[0]
+        TP = self.joints_embed.t_grid_size
+        VP = self.joints_embed.grid_size
+
+        # embed tokens
+        x = self.decoder_embed(x)
+        C = x.shape[-1]
+        # append intra mask tokens to sequence
+        mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
+        x_ = torch.cat([x, mask_tokens], dim=1)# no cls token
+
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))# unshuffle
+
+        x = x_.view([NM, TP, VP, C])
+        # add pos & temp embed
+        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
+        # apply Transformer blocks
+        x = x.reshape(NM, TP * VP, C)
+        for blk in self.decoder_blocks2:
+            x = blk(x)
+        x = self.decoder_norm2(x)
+        return x
 
     def forward_loss(self, student_latent, student_orginal_motion, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
         # contrastive loss between student latent after prediction and teacher latent
@@ -854,8 +912,8 @@ class Model(nn.Module):
         # cossim = nn.CosineSimilarity(dim=1, eps=1e-6)
         # recon_loss = 1 - cossim(student_latent, teacher_latent)
         # recon_loss = recon_loss.mean()
-
-        recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
+        recon_loss_latent =(student_latent-teacher_latent)**2
+        # recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
         # print('recon_loss_latent', recon_loss_latent.shape)
         # print('mask', mask.shape)
         # recon_loss_latent = F.smooth_l1_loss(student_latent, teacher_latent, reduction='none')
@@ -865,10 +923,10 @@ class Model(nn.Module):
         
         # original motion from target
         target = self.patchify(target) # [NM, TP * VP, C]
-        if recon_loss<0.0002:
-            print('teacher_latent', teacher_latent)
-            print('student_latent', student_latent)
-            raise ValueError('recon_loss is too low')
+        # if recon_loss<0.0002:
+        #     print('teacher_latent', teacher_latent)
+        #     print('student_latent', student_latent)
+        #     raise ValueError('recon_loss is too low')
 
         if self.norm_skes_loss:
             mean = target.mean(dim=-1, keepdim=True)
@@ -880,25 +938,26 @@ class Model(nn.Module):
         
         # contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
         loss=(student_orginal_motion-target)**2
-        contrastive_loss_original = loss.mean(dim=-1) * mask/ (mask.sum() + 1e-8)
+        loss=loss.mean(dim=-1)
+        contrastive_loss_original = (loss * mask).sum()/ (mask.sum() + 1e-8)
 
         # recon_loss = recon_loss + lambda2 * contrastive_loss_original.mean()
         # contrasive loss between teacher motion and original motion
         # contrastive_loss_original = F.mse_loss(target, teacher_orginal_motion, reduction='none')
-        lambda_value = 0.5
-        recon_loss_weight = recon_loss / (contrastive_loss_original.mean() + 1e-8)
-        if recon_loss_weight > 1.0:
-            lambda_value *= 1.05  
-        else:
-            lambda_value *= 0.95  
+        lambda_value = 1.0
+        # recon_loss_weight = recon_loss / contrastive_loss_original
+        # if recon_loss_weight > lambda_value:
+        #     lambda_value *= 1.05  
+        # else:
+        #     lambda_value *= 0.95  
+        # lambda_value = 0.75
 
-
-        lambda_value = max(min(lambda_value, 2.0), 0.1)
+        # lambda_value = max(min(lambda_value, 2.0), 0.1)
 
         # recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
-        recon_loss = recon_loss + lambda_value * contrastive_loss_original.mean()
-    
-        return recon_loss
+        # recon_loss2 = recon_loss + lambda_value * contrastive_loss_original
+        recon_loss2 =  recon_loss + lambda_value * contrastive_loss_original
+        return recon_loss2, recon_loss, contrastive_loss_original
     
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
         
@@ -907,35 +966,51 @@ class Model(nn.Module):
         x_motion = self.extract_motion(x, motion_stride)
         # x_embed = self.joints_embed(x)
         # get teacher latent from teacher encoder
-        teacher_latent,teacher_latent2, maskteacher, ids_restoreteacher = self.teacher(x,mask_ratio=0.0, motion_aware_tau=0.0)
+        teacher_latent,teacher_latent2, maskteacher, ids_restoreteacher,ids_keep = self.teacher(x,mask_ratio=0.0, motion_aware_tau=0.0)
         # print('teacher_latent1',teacher_latent.shape)
         # teacher_latent = self.generate_normalized_teacher_targets(teacher_latent2)
         # get student latent from student encoder after masking
         # print('teacher_latent4',teacher_latent.shape)
         # print('mask_ratio', mask_ratio)
         # print('motion_aware_tau', motion_aware_tau)
-        student_latent, student_latent2, mask, ids_restore= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
+        student_latent, student_latent2, mask, ids_restore, ids_keep= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
         # predict student latent using predictor
         # print('mask', mask.shape)
         # print('student_latent', student_latent.shape)
-        student_latent, student_latent2 = self.predictor(student_latent, ids_restore)
+        student_latent3, student_latent2 = self.predictor(student_latent, ids_restore)
 
         # Linear
+        # student_latent = student_latent2
         # student_latent = self.decoder_pred(student_latent2)
         # student_orginal_motion = self.decoder_pred_recon(student_latent2)
 
+
         # MLP
-        student_latent = self.decoder_pred_mlp(student_latent2)
-        student_orginal_motion = self.decoder_pred_recon_mlp(student_latent2)
+        # student_latent = self.decoder_pred_mlp(student_latent2)
+        # student_orginal_motion = self.decoder_pred_recon_mlp(student_latent2)
+
+        # Arch C
+        # student_latent =student_latent2
+        # student_latent2 = self.decoder(student_latent2)
+        # student_orginal_motion = self.decoder_pred_recon(student_latent2)
+        # Arch D
+        # student_latent4 = self.decoder(student_latent, ids_restore)
+        # student_orginal_motion = self.decoder_pred_recon(student_latent4)
+        # student_latent = student_latent2
+
+        # Arch E
+        student_latent5= self.mask(student_latent2,mask,ids_keep)
+        student_latent4 = self.decoder2(student_latent5, ids_restore)
+        student_orginal_motion = self.decoder_pred_recon(student_latent4)
+        student_latent = student_latent2
 
         # student_latent= self.generate_normalized_student_targets(student_latent)
         # print('student_latent', student_latent.shape)
         # print('student_latent_predicted ', student_latent.shape)
         # print('teacher_latent', teacher_latent.shape)
-        loss = self.forward_loss(student_latent,student_orginal_motion, teacher_latent, x_motion, mask, ids_restore)
+        loss, loss_recon1, loss_recon2 = self.forward_loss(student_latent,student_orginal_motion, teacher_latent, x_motion, mask, ids_restore)
         
-        return loss, student_latent, mask
-
+        return loss, loss_recon1, loss_recon2
 
 class Encoder(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
@@ -1095,12 +1170,12 @@ class Encoder(nn.Module):
             if motion_aware_tau > 0:
                 x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
                 # print('x_orig', x_orig.shape)
-                x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+                x, mask, ids_restore, ids_keep= self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
                 # print('x', x.shape)
             else:   
-                x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+                x, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
         else:
-            x, mask, ids_restore, _ = self.random_masking(x, mask_ratio=0.0)
+            x, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio=0.0)
         # apply Transformer blocks
         
         if self.is_teacher:
@@ -1114,13 +1189,13 @@ class Encoder(nn.Module):
             latent = torch.stack(latent)
             # print('latent', latent.shape)
             
-            return x, latent, mask, ids_restore
+            return x, latent, mask, ids_restore,ids_keep
         else:
             for idx, blk in enumerate(self.blocks):
                 x = blk(x)
 
             x = self.norm(x)
-            return x, x, mask, ids_restore
+            return x, x, mask, ids_restore,ids_keep
 
     def forward(self, x, mask_ratio=0.0, motion_aware_tau=0.0):
         if self.is_teacher:
