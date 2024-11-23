@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=ntu60
-#SBATCH --output=slurm_out10/%j.out
-#SBATCH --error=slurm_out10/%j.err
-#SBATCH --mem=80G                      
-#SBATCH --time=04:00:00
-#SBATCH --partition=h100
+#SBATCH --output=slurm_out6/%j.out
+#SBATCH --error=slurm_out6/%j.err
+#SBATCH --mem=100G                      
+#SBATCH --time=12:00:00
+#SBATCH --partition=l40s
 #SBATCH --cpus-per-task=40
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:2
+#SBATCH --ntasks=2
+#SBATCH --gres=gpu:4
 
 
 
@@ -30,9 +30,9 @@ echo "Running on host: $HOSTNAME"
 # --log_dir ./output_dir/ntu60_xsub_joint/linear_mae_t120_layer8+3_mask90_ep400_400 \
 # --finetune ./output_dir/ntu60_xsub_joint/pretrain_mae_t120_layer8+3_mask90_ep400_noamp/checkpoint-399.pth \
 # --dist_eval
-torchrun --nproc_per_node=2 --master_port 12345 main_linprobe.py \
+python -m torch.distributed.launch --nproc_per_node=4 --master_port 12345 main_linprobe.py \
 --config ./config/ntu60_xsub_joint/linprobe_t120_layer8.yaml \
---output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_drop0.0_mask90_tau0.80_ep1200_noamp_linear_MSE_v1 \
---log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_drop0.0_mask90_tau0.80_ep1200_noamp_linear_MSE_v1 \
---finetune /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_linear_MSE_v1/checkpoint-599.pth \
+--output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_L2_.0reconv1_v3_mom \
+--log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_L2_.0reconv1_v3_mom \
+--finetune /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_L2_.0reconv1_v3_mom/checkpoint-40.pth \
 --dist_eval

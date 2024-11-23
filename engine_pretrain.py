@@ -59,12 +59,14 @@ def train_one_epoch(model: torch.nn.Module,
         samples = samples.float().to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type='cuda', enabled=args.enable_amp):
-            loss, _, _ = model(samples,
+            loss, loss_recon1, loss_recon2 = model(samples,
                                mask_ratio=args.mask_ratio,
                                motion_stride=args.motion_stride,
                                motion_aware_tau=args.motion_aware_tau)
 
         loss_value = loss.item()
+        loss_recon1_value = loss_recon1.item()
+        loss_recon2_value = loss_recon2.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -91,8 +93,12 @@ def train_one_epoch(model: torch.nn.Module,
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
+        metric_logger.update(loss_recon1=loss_recon1_value)
+        metric_logger.update(loss_recon2=loss_recon2_value)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
+        loss_recon1_value = misc.all_reduce_mean(loss_recon1_value)
+        loss_recon2_value = misc.all_reduce_mean(loss_recon2_value)
         if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
             """ We use epoch_1000x as the x-axis in tensorboard.
             This calibrates different curves when batch size changes.
@@ -100,9 +106,15 @@ def train_one_epoch(model: torch.nn.Module,
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
+            log_writer.add_scalar('train_loss_recon1', loss_recon1_value, epoch_1000x)
+            log_writer.add_scalar('train_loss_recon2', loss_recon2_value, epoch_1000x)
+            # print('Epoch: [{}][{}/{}], lr: {:.6f}, loss: {:.6f}, loss_recon1: {:.6f}, loss_recon2: {:.6f}'.format(
+            #     epoch, data_iter_step, len(data_loader), lr, loss_value_reduce, loss_recon1_value, loss_recon2_value))
+
 
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
