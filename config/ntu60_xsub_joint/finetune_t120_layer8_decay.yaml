@@ -44,9 +44,9 @@ model_args:
   protocol: finetune
 
 # training
-epochs: 250
+epochs: 100
 warmup_epochs: 5
-batch_size: 64
-lr: 5e-4
+batch_size: 40
+lr: 3e-4
 layer_decay: 0.8
 smoothing: 0.1

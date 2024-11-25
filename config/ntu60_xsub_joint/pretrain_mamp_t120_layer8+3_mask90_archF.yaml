@@ -14,22 +14,14 @@ train_feeder_args:
   vel: False
   bone: False
 
-val_feeder_args:
-  data_path: /work/vita/datasets/NTU/NTU60_XSub.npz
-  split: test  
-  debug: False
-  window_size: 120
-  p_interval: [0.95]
-  vel: False
-  bone: False
-
 # model
-model: model.transformer.Transformer
+model: model_mamp.transformerF.Model
 model_args:
   dim_in: 3
-  num_classes: 60
   dim_feat: 256
+  decoder_dim_feat: 256
   depth: 8
+  decoder_depth: 3
   num_heads: 8
   mlp_ratio: 4
   num_frames: 120
@@ -38,13 +30,17 @@ model_args:
   t_patch_size: 4
   qkv_bias: True
   qk_scale: None
-  drop_rate: 0.
-  attn_drop_rate: 0.
-  drop_path_rate: 0.
-  protocol: linprobe
+  drop_rate: 0.05
+  attn_drop_rate: 0.05
+  drop_path_rate: 0.05
+  norm_skes_loss: True
 
 # training
-epochs: 100
-warmup_epochs: 0
-batch_size: 128
-lr: 0.025
+epochs: 600
+warmup_epochs: 20
+batch_size: 64
+lr: 1e-3
+min_lr: 1e-5
+weight_decay: 0.05
+mask_ratio: 0.875
+motion_aware_tau: 0.80

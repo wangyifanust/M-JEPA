@@ -24,7 +24,7 @@ val_feeder_args:
   bone: False
 
 # model
-model: model.transformer.Transformer
+model: model.transformerB.Transformer
 model_args:
   dim_in: 3
   num_classes: 60
@@ -40,11 +40,13 @@ model_args:
   qk_scale: None
   drop_rate: 0.
   attn_drop_rate: 0.
-  drop_path_rate: 0.
-  protocol: linprobe
+  drop_path_rate: 0.3
+  protocol: finetune
 
 # training
 epochs: 100
-warmup_epochs: 0
-batch_size: 128
-lr: 0.025
+warmup_epochs: 5
+batch_size: 40
+lr: 3e-4
+layer_decay: 0.8
+smoothing: 0.1
