@@ -604,30 +604,6 @@ class Transformer(nn.Module):
 # Generic encoder class for student and teacher
 # predicor class
 
-# class complete_mode:
-#   self.student = encoder()
-#   self.teacher = encoder() or copy.deepcopy(self.student)
-#   self.predictor = predictor() // decoder it is in the model class
-# class MLP(nn.Module):
-#     def __init__(self, input_dim, output_dim, hidden_dim, num_layers=2):
-#         super(MLP, self).__init__()
-#         layers = []
-#         # 添加输入层
-#         layers.append(nn.Linear(input_dim, hidden_dim))
-#         layers.append(nn.ReLU())  # 你可以选择其他激活函数
-
-#         # 添加中间隐藏层
-#         for _ in range(num_layers - 2):
-#             layers.append(nn.Linear(hidden_dim, hidden_dim))
-#             layers.append(nn.ReLU())
-
-#         # 添加输出层
-#         layers.append(nn.Linear(hidden_dim, output_dim))
-#         self.mlp = nn.Sequential(*layers)
-
-#     def forward(self, x):
-#         return self.mlp(x)
-
 from torch.nn import InstanceNorm1d
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
@@ -792,9 +768,9 @@ class Model(nn.Module):
         x = self.decoder_norm(x)
         # predict_latent.append(x)
         predict_latent = torch.stack(predict_latent)
-        # print('student_latent1', x.shape)
+    
         # x = self.decoder_pred(x)
-        # print('student_latent2', x.shape)
+    
         return predict_latent, x
     # In the forward or target generation logic
     def generate_normalized_teacher_targets(self, teacher_latents):
@@ -915,9 +891,9 @@ class Model(nn.Module):
         loss = loss.mean(dim=-1)
         contrastive_loss_original = (loss * mask).sum()/ (mask.sum() + 1e-8)
 
-        lambda_value = 1.0
-       
-        recon_loss2 =  recon_loss + lambda_value * contrastive_loss_original
+        lambda_value = 0.0
+        recon_loss2 =  recon_loss
+        # recon_loss2 =  recon_loss + lambda_value * contrastive_loss_original
         return recon_loss2, recon_loss, contrastive_loss_original
     
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
@@ -933,9 +909,9 @@ class Model(nn.Module):
         student_latent3, student_latent2 = self.predictor(student_latent, ids_restore)
 
         # Linear
-        # student_latent = student_latent2
+        student_latent = student_latent2
         # student_latent = self.decoder_pred(student_latent2)
-        # student_orginal_motion = self.decoder_pred_recon(student_latent2)
+        student_orginal_motion = self.decoder_pred_recon(student_latent2)
 
 
         # MLP
@@ -952,10 +928,10 @@ class Model(nn.Module):
         # student_latent = student_latent2
 
         # Arch E
-        student_latent5= self.mask(student_latent2,mask,ids_keep)
-        student_latent4 = self.decoder2(student_latent5, ids_restore)
-        student_orginal_motion = self.decoder_pred_recon(student_latent4)
-        student_latent = student_latent2
+        # student_latent5= self.mask(student_latent2,mask,ids_keep)
+        # student_latent4 = self.decoder2(student_latent5, ids_restore)
+        # student_orginal_motion = self.decoder_pred_recon(student_latent4)
+        # student_latent = student_latent2
 
         loss, loss_recon1, loss_recon2 = self.forward_loss(student_latent,student_orginal_motion, teacher_latent, x_motion, mask, ids_restore)
         
