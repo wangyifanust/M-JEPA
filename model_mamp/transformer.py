@@ -607,7 +607,7 @@ class Transformer(nn.Module):
 #   self.student = encoder()
 #   self.teacher = encoder() or copy.deepcopy(self.student)
 #   self.predictor = predictor() // decoder it is in the model class
-
+import copy
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
@@ -664,11 +664,20 @@ class Model(nn.Module):
         ) # decoder to patch
 
         # Initialize weights
-
+        # self.student = Encoder(dim_in=dim_in, dim_feat=dim_feat, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio,
+        #                          num_frames=num_frames, num_joints=num_joints, patch_size=patch_size, t_patch_size=t_patch_size,
+        #                          qkv_bias=qkv_bias, qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+        #                          drop_path_rate=drop_path_rate, norm_layer=norm_layer, norm_skes_loss=norm_skes_loss, is_teacher=False)
+        # self.teacher = copy.deepcopy(self.student)
+        # for param in self.teacher.parameters():
+        #     param.requires_grad = False
+        # self.teacher.is_teacher = True
+        self.teacher = Encoder(depth=depth,is_teacher=True)
+        self.student = Encoder(depth=depth,is_teacher=False)
         self.apply(self._init_weights)
-        self.teacher = Encoder(is_teacher=True)
-        self.student = Encoder(is_teacher=False)
-
+        # self.teacher = Encoder(is_teacher=True)
+        # self.student = Encoder(is_teacher=False)
+        
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             # we use xavier_uniform following official JAX ViT:
@@ -747,10 +756,8 @@ class Model(nn.Module):
         # decode teacher motion into original motion
         teacher_orginal_motion = self.decoder_pred(teacher_latent)
         # contrastive loss between student motion and original motion
-        lambda2 = 0.05
-        contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
 
-        recon_loss = recon_loss_latent + lambda2 * contrastive_loss_original.mean()
+        recon_loss = recon_loss_latent
 
         # EMA update for teacher encoder
         # with torch.no_grad():
