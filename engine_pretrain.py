@@ -77,7 +77,8 @@ def train_one_epoch(model: torch.nn.Module,
             # EMA 更新教师模型的参数
             # Step 3. Momentum EMA update of target encoder
             with torch.no_grad():
-                m = next(momentum_scheduler)
+                # m = next(momentum_scheduler)
+                m = 0.999
                 for param_q, param_k in zip(model.module.student.parameters(), model.module.teacher.parameters()):
                     # Update target encoder parameters
                     # param_k.data.mul_(m).add_(param_q.detach().data, alpha=1 - m)
