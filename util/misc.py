@@ -18,7 +18,10 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch._six import inf
+# from torch._six import inf
+import math
+inf = math.inf
+
 
 
 class SmoothedValue(object):
@@ -271,7 +274,7 @@ class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 
     def __init__(self):
-        self._scaler = torch.cuda.amp.GradScaler()
+        self._scaler = torch.amp.GradScaler(device='cuda')
 
     def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
         self._scaler.scale(loss).backward(create_graph=create_graph)
@@ -316,9 +319,31 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     epoch_name = str(epoch)
     if loss_scaler is not None:
         checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
-        if model_without_ddp.Student is None:
-            print("No student model found!")
-        if model_without_ddp.Teacher is None:
+        # if model_without_ddp.student is None:
+        #     print("No student model found!")
+        if model_without_ddp.teacher is None:
+            print("No teacher model found!")
+        for checkpoint_path in checkpoint_paths:
+            to_save = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+                # 'student': model_without_ddp.Student.state_dict() if model_without_ddp.Student is not None else None,
+                # 'teacher': model_without_ddp.Teacher.state_dict() if model_without_ddp.Teacher is not None else None
+            }
+
+            save_on_master(to_save, checkpoint_path)
+    else:
+        client_state = {'epoch': epoch}
+        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+def save_model2(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+    output_dir = Path(args.output_dir)
+    epoch_name = str(epoch)
+    if loss_scaler is not None:
+        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        if model_without_ddp.teacher is None:
             print("No teacher model found!")
         for checkpoint_path in checkpoint_paths:
             to_save = {

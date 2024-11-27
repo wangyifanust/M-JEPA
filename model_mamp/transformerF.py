@@ -227,16 +227,10 @@ class Model(nn.Module):
         self.joints_embed = SkeleEmbed(dim_in, dim_feat, num_frames, num_joints, patch_size, t_patch_size)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        self.blocks = nn.ModuleList([
-            Block(
-                dim=dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
-            for i in range(depth)])
-        self.norm = norm_layer(dim_feat)
-
-        self.temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, dim_feat))
+        # self.norm = norm_layer(dim_feat)
+        # self.temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, dim_feat))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints//patch_size, dim_feat))
-        trunc_normal_(self.temp_embed, std=.02)
+        # trunc_normal_(self.temp_embed, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
         # MAE Decoder specifics
         self.decoder_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
@@ -268,10 +262,14 @@ class Model(nn.Module):
         self.teacher = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
                                mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
                                drop_path_rate, norm_layer, norm_skes_loss, is_teacher=True)
-        self.student = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
-                               mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
-                               drop_path_rate, norm_layer, norm_skes_loss, is_teacher=False)
-
+        # self.student = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
+        #                        mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
+        #                        drop_path_rate, norm_layer, norm_skes_loss, is_teacher=False)
+        self.student = copy.deepcopy(self.teacher)
+        for param in self.student.parameters():
+            param.requires_grad = True
+        self.student.is_teacher = False
+        self.teacher.is_teacher = True
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             # we use xavier_uniform following official JAX ViT:
@@ -336,24 +334,19 @@ class Model(nn.Module):
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
         
         recon_loss_latent = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
-        # decode student motion into original motion 
-        student_orginal_motion = self.decoder_pred(student_latent)
         
         # original motion from target
         target = self.patchify(target) # [NM, TP * VP, C]
-
 
         if self.norm_skes_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.0e-6) ** 0.5
         # decode teacher motion into original motion
-        teacher_orginal_motion = self.decoder_pred(teacher_latent)
-        # contrastive loss between student motion and original motion
-        lambda2 = 0.0
         # contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
         contrastive_loss_original = F.mse_loss(target, target, reduction='none')
-        recon_loss = recon_loss_latent
+        recon_loss = recon_loss_latent.mean()
+        return recon_loss, recon_loss_latent.mean(), contrastive_loss_original.mean()
     
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
         

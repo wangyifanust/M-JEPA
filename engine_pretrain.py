@@ -30,7 +30,7 @@ def train_one_epoch(model: torch.nn.Module,
     print_freq = 20
 
     accum_iter = args.accum_iter
-    ema_start = 0.999  # Starting EMA momentum, e.g., 0.996
+    ema_start = 0.995  # Starting EMA momentum, e.g., 0.996
     ema_end = 0.9999    # Ending EMA momentum, e.g., 1.0
     num_epochs = epochs
     ipe_scale = 1  # Scaling factor if needed
@@ -78,8 +78,8 @@ def train_one_epoch(model: torch.nn.Module,
         if (data_iter_step + 1) % accum_iter == 0:
             # Step 3. Momentum EMA update of target encoder
             with torch.no_grad():
-                # m = next(momentum_scheduler)
-                m =0.99
+                m = next(momentum_scheduler)
+                # m =0.99
                 for param_q, param_k in zip(model.module.student.parameters(), model.module.teacher.parameters()):
                     # Update target encoder parameters
                     # param_k.data.mul_(m).add_(param_q.detach().data, alpha=1 - m)

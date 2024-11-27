@@ -204,12 +204,16 @@ def main(args):
         model_without_ddp = model.module
     
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    # param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    # print(param_groups)
     # param_groups = optim_factory.add_weight_decay(filter(lambda p: p.requires_grad, model_without_ddp.parameters()), args.weight_decay)
     # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model_without_ddp.parameters()), 
+                                  lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
 
-    print(optimizer)
+    # Print optimizer's parameter groups and their corresponding model structure
+
+
     loss_scaler = NativeScaler()
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)

@@ -605,6 +605,7 @@ class Transformer(nn.Module):
 # predicor class
 
 from torch.nn import InstanceNorm1d
+import copy
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
@@ -618,23 +619,18 @@ class Model(nn.Module):
         self.num_joints = num_joints
         self.patch_size = patch_size
         self.t_patch_size = t_patch_size
-        self.drop_rate = drop_rate  
+
         self.norm_skes_loss = norm_skes_loss
+        self.drop_rate = drop_rate  
         
         # MAE Encoder specifics
         self.joints_embed = SkeleEmbed(dim_in, dim_feat, num_frames, num_joints, patch_size, t_patch_size)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        self.blocks = nn.ModuleList([
-            Block(
-                dim=dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
-            for i in range(depth)])
-        self.norm = norm_layer(dim_feat)
-
-        self.temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, dim_feat))
+        # self.norm = norm_layer(dim_feat)
+        # self.temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, dim_feat))
         self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints//patch_size, dim_feat))
-        trunc_normal_(self.temp_embed, std=.02)
+        # trunc_normal_(self.temp_embed, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
         # MAE Decoder specifics
         self.decoder_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
@@ -662,11 +658,9 @@ class Model(nn.Module):
 
         self.decoder_pred = nn.Linear(
             decoder_dim_feat,
-            # t_patch_size * patch_size * dim_in,
-            decoder_dim_feat,
+            t_patch_size * patch_size * dim_in,
             bias=True
         ) # decoder to patch
-        
         self.decoder_pred_recon = nn.Linear(
             decoder_dim_feat,
             t_patch_size * patch_size * dim_in,
@@ -686,18 +680,19 @@ class Model(nn.Module):
         )
 
         # Initialize weights
-        self.instance_norm = InstanceNorm1d(dim_feat,affine=False)
-        self.instance_norm_predictor = InstanceNorm1d(decoder_dim_feat,affine=False)
-        self.norm_context_teacher= nn.LayerNorm(dim_feat)
-        self.norm_context_student= nn.LayerNorm(dim_feat)
+
         self.apply(self._init_weights)
         self.teacher = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
                                mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
                                drop_path_rate, norm_layer, norm_skes_loss, is_teacher=True)
-        self.student = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
-                               mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
-                               drop_path_rate, norm_layer, norm_skes_loss, is_teacher=False)
-
+        # self.student = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
+        #                        mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
+        #                        drop_path_rate, norm_layer, norm_skes_loss, is_teacher=False)
+        self.student = copy.deepcopy(self.teacher)
+        for param in self.student.parameters():
+            param.requires_grad = True
+        self.student.is_teacher = False
+        self.teacher.is_teacher = True
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             # we use xavier_uniform following official JAX ViT:
@@ -873,6 +868,28 @@ class Model(nn.Module):
             x = blk(x)
         x = self.decoder_norm2(x)
         return x
+    def decoder3(self, x):
+        NM = x.shape[0]
+        TP = self.joints_embed.t_grid_size
+        VP = self.joints_embed.grid_size
+
+        # embed tokens
+        x = self.decoder_embed(x)
+        C = x.shape[-1]
+        # append intra mask tokens to sequence
+        # mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
+        # x_ = torch.cat([x, mask_tokens], dim=1)
+        x = x.reshape(NM, TP, VP, C)
+        # add pos & temp embed
+        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
+        # apply Transformer blocks
+        x = x.reshape(NM, TP * VP, C)
+        for blk in self.decoder_blocks2:
+            x = blk(x)
+        x = self.decoder_norm2(x)
+        return x
+    
+
 
     def forward_loss(self, student_latent, student_orginal_motion, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
 
@@ -891,9 +908,9 @@ class Model(nn.Module):
         loss = loss.mean(dim=-1)
         contrastive_loss_original = (loss * mask).sum()/ (mask.sum() + 1e-8)
 
-        lambda_value = 0.0
-        recon_loss2 =  recon_loss
-        # recon_loss2 =  recon_loss + lambda_value * contrastive_loss_original
+        lambda_value = 1.0
+        # recon_loss2 =  recon_loss
+        recon_loss2 =  recon_loss + lambda_value * contrastive_loss_original
         return recon_loss2, recon_loss, contrastive_loss_original
     
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
@@ -909,9 +926,9 @@ class Model(nn.Module):
         student_latent3, student_latent2 = self.predictor(student_latent, ids_restore)
 
         # Linear
-        student_latent = student_latent2
+        # student_latent = student_latent2
         # student_latent = self.decoder_pred(student_latent2)
-        student_orginal_motion = self.decoder_pred_recon(student_latent2)
+        # student_orginal_motion = self.decoder_pred_recon(student_latent2)
 
 
         # MLP
@@ -919,9 +936,9 @@ class Model(nn.Module):
         # student_orginal_motion = self.decoder_pred_recon_mlp(student_latent2)
 
         # Arch C
-        # student_latent =student_latent2
-        # student_latent2 = self.decoder(student_latent2)
-        # student_orginal_motion = self.decoder_pred_recon(student_latent2)
+        student_latent =student_latent2
+        student_latent2 = self.decoder3(student_latent2)
+        student_orginal_motion = self.decoder_pred_recon(student_latent2)
         # Arch D
         # student_latent4 = self.decoder(student_latent, ids_restore)
         # student_orginal_motion = self.decoder_pred_recon(student_latent4)
