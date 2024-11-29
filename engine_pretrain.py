@@ -30,8 +30,8 @@ def train_one_epoch(model: torch.nn.Module,
     print_freq = 20
 
     accum_iter = args.accum_iter
-    ema_start = 0.995  # Starting EMA momentum, e.g., 0.996
-    ema_end = 0.9999    # Ending EMA momentum, e.g., 1.0
+    ema_start = 0.9998  # Starting EMA momentum, e.g., 0.996
+    ema_end = 1    # Ending EMA momentum, e.g., 1.0
     num_epochs = epochs
     ipe_scale = 1  # Scaling factor if needed
     ipe = len(data_loader)      # Iterations per epoch

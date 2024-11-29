@@ -658,7 +658,7 @@ class Model(nn.Module):
 
         self.decoder_pred = nn.Linear(
             decoder_dim_feat,
-            t_patch_size * patch_size * dim_in,
+            decoder_dim_feat,
             bias=True
         ) # decoder to patch
         self.decoder_pred_recon = nn.Linear(
@@ -936,13 +936,13 @@ class Model(nn.Module):
         # student_orginal_motion = self.decoder_pred_recon_mlp(student_latent2)
 
         # Arch C
-        student_latent =student_latent2
-        student_latent2 = self.decoder3(student_latent2)
-        student_orginal_motion = self.decoder_pred_recon(student_latent2)
+        # student_latent =student_latent2
+        # student_latent2 = self.decoder3(student_latent2)
+        # student_orginal_motion = self.decoder_pred_recon(student_latent2)
         # Arch D
-        # student_latent4 = self.decoder(student_latent, ids_restore)
-        # student_orginal_motion = self.decoder_pred_recon(student_latent4)
-        # student_latent = student_latent2
+        student_latent4 = self.decoder(student_latent, ids_restore)
+        student_orginal_motion = self.decoder_pred_recon(student_latent4)
+        student_latent = student_latent2
 
         # Arch E
         # student_latent5= self.mask(student_latent2,mask,ids_keep)

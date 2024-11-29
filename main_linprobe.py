@@ -221,7 +221,7 @@ def main(args):
         msg = model.load_state_dict(checkpoint_model, strict=False)
         print(msg)
 
-        assert set(msg.missing_keys) == {'head.fc.weight', 'head.fc.bias'}
+        # assert set(msg.missing_keys) == {'head.fc.weight', 'head.fc.bias'}
 
         # manually initialize fc layer: following MoCo v3
         trunc_normal_(model.head.fc.weight, std=0.01)

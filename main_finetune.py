@@ -245,7 +245,9 @@ def main(args):
                 del checkpoint_model[k]
 
         # interpolate position embedding
-        interpolate_temp_embed(model, checkpoint_model)
+        if 'temp_embed' in checkpoint_model:
+            interpolate_temp_embed(model, checkpoint_model)
+        # interpolate_temp_embed(model, checkpoint_model)
 
         # load pre-trained model
         msg = model.load_state_dict(checkpoint_model, strict=False)
@@ -258,7 +260,7 @@ def main(args):
         assert missing_keys_check_passed == True
         
         model = model.to(device)
-        if model.teacher is not None:
+        if hasattr(model, 'teacher') and model.teacher is not None:
             model.teacher = model.teacher.to(device)
             print("Teacher model loaded and moved to device.")
         else:
@@ -297,8 +299,9 @@ def main(args):
     )
     
     # optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, eps=1e-8)
-
+    # optimizer = torch.optim.AdamW(param_groups, lr=args.lr, eps=1e-8)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model_without_ddp.parameters()),
+                                   lr=args.lr, eps=1e-8, weight_decay=args.weight_decay)
 
     loss_scaler = NativeScaler()
     # for param_group in optimizer.param_groups:
