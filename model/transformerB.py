@@ -307,9 +307,9 @@ class Transformer(nn.Module):
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
         # embed skeletons
         # self.teacher= self.set_teacher()
-        # x = self.teacher.forward_encoder(x, mask_ratio=0.0, motion_aware_tau=0.0)
-        x =self.student.forward_encoder(x, mask_ratio=0.0, motion_aware_tau=0.0)
-        x = x.reshape(N, M, TP, VP, -1)
+        x = self.teacher.forward_encoder(x, mask_ratio=0.0, motion_aware_tau=0.0)
+        # x =self.student.forward_encoder(x, mask_ratio=0.0, motion_aware_tau=0.0)
+        # x = x.reshape(N, M, TP, VP, -1)
         x = self.head(x)
         return x
 

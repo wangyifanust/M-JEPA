@@ -32,7 +32,7 @@ echo "Running on host: $HOSTNAME"
 # --dist_eval
 torchrun --nproc_per_node=4 --nproc_per_node=4 --master_port 12345 main_linprobe.py \
 --config ./config/ntu60_xsub_joint/linprobe_t120_layer8.yaml \
---output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/ft_mamp_t120_layer8+5_mask90_tau0.80_ep400_noamp_MLP_MSE_archB_v4 \
---log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/ft_mamp_t120_layer8+5_mask90_tau0.80_ep400_noamp_MLP_MSE_archB_v4 \
+--output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_mask90_tau0.80_ep400_noamp_MLP_MSE_archB_v4 \
+--log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_mask90_tau0.80_ep400_noamp_MLP_MSE_archB_v4 \
 --finetune /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_MLP_MSE_archB_v4/checkpoint-599.pth \
 --dist_eval

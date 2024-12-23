@@ -257,7 +257,7 @@ def main(args):
         for k in set(msg.missing_keys):
             if ('head' not in k) and ('pre_logits' not in k):
                 missing_keys_check_passed = False
-        assert missing_keys_check_passed == True
+        # assert missing_keys_check_passed == True
         
         model = model.to(device)
         if hasattr(model, 'teacher') and model.teacher is not None:

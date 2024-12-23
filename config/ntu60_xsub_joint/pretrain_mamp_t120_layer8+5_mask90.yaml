@@ -36,11 +36,11 @@ model_args:
   norm_skes_loss: True
 
 # training
-epochs: 1200
+epochs: 600
 warmup_epochs: 20
 batch_size: 64
 lr: 1e-3
-min_lr: 2e-5
+min_lr: 1e-5
 weight_decay: 0.05
 mask_ratio: 0.9
 motion_aware_tau: 0.80

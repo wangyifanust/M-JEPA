@@ -4,7 +4,7 @@
 #SBATCH --error=slurm_out15/%j.err
 #SBATCH --mem=80G                      
 #SBATCH --time=04:00:00
-#SBATCH --partition=h100
+#SBATCH --partition=l40s
 #SBATCH --cpus-per-task=40
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:4
@@ -32,7 +32,7 @@ echo "Running on host: $HOSTNAME"
 # --dist_eval
 torchrun --nproc_per_node=4 --master_port 12345 main_linprobe.py \
 --config ./config/ntu60_xsub_joint/linprobe_t120_layer8.yaml \
---output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_drop0.0_mask90_tau0.80_ep1200_noamp_Linear_MSE_archDv1 \
---log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_drop0.0_mask90_tau0.80_ep1200_noamp_Linear_MSE_archDv1 \
---finetune /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_Linear_MSE_archDv1/checkpoint-599.pth \
+--output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_drop0.0_mask90_tau0.80_ep1200_noamp_Linear_MSE_archDv3 \
+--log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/linear_mamp_t120_layer8+5_drop0.0_mask90_tau0.80_ep1200_noamp_Linear_MSE_archDv3 \
+--finetune /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_Linear_MSE_archDv3/checkpoint-599.pth \
 --dist_eval

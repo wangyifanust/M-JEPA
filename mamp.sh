@@ -2,14 +2,14 @@
 #SBATCH --job-name=ntu60
 #SBATCH --output=slurm_out14/%j.out
 #SBATCH --error=slurm_out14/%j.err
-#SBATCH --mem=200G                      
+#SBATCH --mem=100G                      
 #SBATCH --time=20:20:00
 #SBATCH --partition=h100
-#SBATCH --account=vita
+
 #SBATCH --cpus-per-task=40
 #SBATCH --ntasks=4
 #SBATCH --gres=gpu:4
-
+#SBATCH --mail-user=yifan.wang@epfl.ch
 
 # module load python/3.8
 
