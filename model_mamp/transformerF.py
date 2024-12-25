@@ -206,6 +206,45 @@ import copy
 #   self.student = encoder()
 #   self.teacher = encoder() or copy.deepcopy(self.student)
 #   self.predictor = predictor() // decoder it is in the model class
+class VICRegLoss(nn.Module):
+    def __init__(self, sim_coeff=25.0, var_coeff=25.0, cov_coeff=1.0, eps=1e-4):
+        super(VICRegLoss, self).__init__()
+        self.sim_coeff = sim_coeff
+        self.var_coeff = var_coeff
+        self.cov_coeff = cov_coeff
+        self.eps = eps
+
+    def forward(self, x, y):
+        # Invariance term (mean squared error)
+        sim_loss = F.mse_loss(x, y)
+
+        # Variance term (ensure feature variance > threshold)
+        std_x = torch.sqrt(x.var(dim=0) + self.eps)
+        std_y = torch.sqrt(y.var(dim=0) + self.eps)
+        var_loss = torch.mean(F.relu(1 - std_x)) + torch.mean(F.relu(1 - std_y))
+
+        # Covariance term (decorrelate features)
+        x = x - x.mean(dim=0)
+        y = y - y.mean(dim=0)
+        cov_x = (x.T @ x) / (x.shape[0] - 1)
+        cov_y = (y.T @ y) / (y.shape[0] - 1)
+        cov_loss = (cov_x.pow(2).sum() - torch.diagonal(cov_x).pow(2).sum()) / x.shape[1]
+        cov_loss += (cov_y.pow(2).sum() - torch.diagonal(cov_y).pow(2).sum()) / y.shape[1]
+
+        # Total loss
+        loss = self.sim_coeff * sim_loss + self.var_coeff * var_loss + self.cov_coeff * cov_loss
+        return loss
+    
+def apply_masks(x, masks):
+    """
+    :param x: tensor of shape [B (batch-size), N (num-patches), D (feature-dim)]
+    :param masks: list of tensors containing indices of patches in [N] to keep
+    """
+    all_x = []
+    for m in masks:
+        mask_keep = m.unsqueeze(-1).repeat(1, 1, x.size(-1))
+        all_x += [torch.gather(x, dim=1, index=mask_keep)]
+    return torch.cat(all_x, dim=0)
 
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
@@ -252,9 +291,9 @@ class Model(nn.Module):
 
         self.decoder_pred = nn.Linear(
             decoder_dim_feat,
-            t_patch_size * patch_size * dim_in,
+            dim_feat,
             bias=True
-        ) # decoder to patch
+        ) 
 
         # Initialize weights
 
@@ -302,38 +341,49 @@ class Model(nn.Module):
         x = x.reshape(shape=(NM, TP * VP, u * p * C))
         return x
 
-    def predictor(self, x, ids_restore):
-        # predict the student latent 
-        NM = x.shape[0]
-        TP = self.joints_embed.t_grid_size
-        VP = self.joints_embed.grid_size
+    def predictor(self, x, list_of_masks):
+        """
+        x: [B, N_vis, C]
+        list_of_masks: 假设里边有 k 个不同的mask,每个mask表示要预测的N_mask个位置
+        """
+        B, N_vis, C_in = x.shape
+        k = len(list_of_masks)
 
-        # embed tokens
+        # 1) 先把可见 token 重复 k 次
         x = self.decoder_embed(x)
-        C = x.shape[-1]
-        # append intra mask tokens to sequence
-        mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
-        x_ = torch.cat([x, mask_tokens], dim=1)# no cls token
+        x = x.repeat(k, 1, 1)  # -> [k*B, N_vis, C_dec]
 
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))# unshuffle
+        # 2) 为每个 mask 生成 mask tokens
+        #    假设 list_of_masks[i] ~ shape: [B, N_mask_i]
+        #    则拼一起 => [k*B, sum_of(N_mask_i), C_dec] (可根据需要分多次拼接)
+        #    这里仅做示例，假设每个mask大小一样
+        N_mask = list_of_masks[0].shape[1]  # 每个mask大小都一样的话
+        # ...
+        mask_tokens = self.mask_token.repeat(k*B, N_mask, 1)
 
-        x = x_.view([NM, TP, VP, C])
-        # add pos & temp embed
-        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
-        # apply Transformer blocks
-        x = x.reshape(NM, TP * VP, C)
+        # 3) 拼接
+        x_cat = torch.cat([x, mask_tokens], dim=1)
 
+        # 4) Decoder
         for blk in self.decoder_blocks:
-            x = blk(x)
+            x_cat = blk(x_cat)
+        x_cat = self.decoder_norm(x_cat)
 
-        x = self.decoder_norm(x)
-        return x
+        # 5) 只拿后面的 mask 部分 => [k*B, N_mask, C_dec]
+        x_mask_out = x_cat[:, N_vis:, :]
+
+        x_mask_out = self.decoder_pred(x_mask_out)
+        
+        return x_mask_out
+
 
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
         # contrastive loss between student latent after prediction and teacher latent
+        
+
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
         
-        recon_loss_latent = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
+        # recon_loss_latent = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
         
         # original motion from target
         target = self.patchify(target) # [NM, TP * VP, C]
@@ -359,7 +409,9 @@ class Model(nn.Module):
         # get student latent from student encoder after masking
         student_latent, mask, ids_restore= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
         # predict student latent using predictor
-        student_latent_predicted = self.predictor(student_latent, ids_restore)
+        teacher_latent = F.layer_norm(teacher_latent, (teacher_latent.shape[-1],))
+        teacher_latent = apply_masks(teacher_latent, mask)
+        student_latent_predicted = self.predictor(student_latent, mask)
         # print('student_latent_predicted ', student_latent_predicted .shape)
         # print('teacher_latent', teacher_latent.shape)
         loss,loss1,loss2 = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
