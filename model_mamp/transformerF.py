@@ -235,17 +235,17 @@ class VICRegLoss(nn.Module):
         loss = self.sim_coeff * sim_loss + self.var_coeff * var_loss + self.cov_coeff * cov_loss
         return loss
     
-def apply_masks(x, masks):
-    """
-    :param x: tensor of shape [B (batch-size), N (num-patches), D (feature-dim)]
-    :param masks: list of tensors containing indices of patches in [N] to keep
-    """
-    all_x = []
-    for m in masks:
-        mask_keep = m.unsqueeze(-1).repeat(1, 1, x.size(-1)).to(dtype=torch.int64)
+# def apply_masks(x, masks):
+#     """
+#     :param x: tensor of shape [B (batch-size), N (num-patches), D (feature-dim)]
+#     :param masks: list of tensors containing indices of patches in [N] to keep
+#     """
+#     all_x = []
+#     for m in masks:
+#         mask_keep = m.unsqueeze(-1).repeat(1, 1, x.size(-1)).to(dtype=torch.int64)
 
-        all_x += [torch.gather(x, dim=1, index=mask_keep)]
-    return torch.cat(all_x, dim=0)
+#         all_x += [torch.gather(x, dim=1, index=mask_keep)]
+#     return torch.cat(all_x, dim=0)
 
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
@@ -341,12 +341,16 @@ class Model(nn.Module):
             x_cat = blk(x_cat)
         x_cat = self.decoder_norm(x_cat)
         x_mask_out = x_cat[:, N_vis:, :]
+        # print('x_mask_out1', x_mask_out.shape)
         x_mask_out = self.decoder_pred(x_mask_out)
+        # print('x_mask_out2', x_mask_out.shape)
         
         return x_mask_out
 
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore):
+
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
+        recon_loss = (recon_loss_latent.mean(dim=-1) * mask).sum() /  (mask.sum() + 1e-8)
         target = self.patchify(target)
 
         if self.norm_skes_loss:
@@ -367,8 +371,17 @@ class Model(nn.Module):
         student_latent, mask, ids_restore, ids_keep = self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
         
         teacher_latent = F.layer_norm(teacher_latent, (teacher_latent.size(-1),))
-        teacher_latent = apply_masks(teacher_latent, mask)
+        # print('teacher_latent', teacher_latent.shape)
+        # print('ids_keep', ids_keep.shape)
+        # print('mask', mask.shape)
+        # teacher_latent = torch.gather(
+        #     teacher_latent, 
+        #     dim=1, 
+        #     index=ids_keep.unsqueeze(-1).repeat(1, 1, teacher_latent.size(-1))
+        # )
+        # print('teacher_latent', teacher_latent.shape)
         student_latent_predicted = self.predictor(student_latent, mask)
+        # print('student_latent_predicted', student_latent_predicted.shape)
 
         loss, loss1, loss2 = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
 
