@@ -242,7 +242,8 @@ def apply_masks(x, masks):
     """
     all_x = []
     for m in masks:
-        mask_keep = m.unsqueeze(-1).repeat(1, 1, x.size(-1))
+        mask_keep = m.unsqueeze(-1).repeat(1, 1, x.size(-1)).to(dtype=torch.int64)
+
         all_x += [torch.gather(x, dim=1, index=mask_keep)]
     return torch.cat(all_x, dim=0)
 
@@ -261,19 +262,17 @@ class Model(nn.Module):
         self.t_patch_size = t_patch_size
 
         self.norm_skes_loss = norm_skes_loss
-        
+
         # MAE Encoder specifics
         self.joints_embed = SkeleEmbed(dim_in, dim_feat, num_frames, num_joints, patch_size, t_patch_size)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        # self.norm = norm_layer(dim_feat)
-        # self.temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, dim_feat))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints//patch_size, dim_feat))
-        # trunc_normal_(self.temp_embed, std=.02)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints // patch_size, dim_feat))
         trunc_normal_(self.pos_embed, std=.02)
+
         # MAE Decoder specifics
         self.decoder_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
-        
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim_feat))
         trunc_normal_(self.mask_token, std=.02)
 
@@ -282,52 +281,41 @@ class Model(nn.Module):
                 dim=decoder_dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(decoder_depth)])
+
         self.decoder_norm = norm_layer(decoder_dim_feat)
 
-        self.decoder_temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, decoder_dim_feat))
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints//patch_size, decoder_dim_feat))
+        self.decoder_temp_embed = nn.Parameter(torch.zeros(1, num_frames // t_patch_size, 1, decoder_dim_feat))
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints // patch_size, decoder_dim_feat))
         trunc_normal_(self.decoder_temp_embed, std=.02)
         trunc_normal_(self.decoder_pos_embed, std=.02)
 
-        self.decoder_pred = nn.Linear(
-            decoder_dim_feat,
-            dim_feat,
-            bias=True
-        ) 
-
-        # Initialize weights
+        self.decoder_pred = nn.Linear(decoder_dim_feat, dim_feat, bias=True)
 
         self.apply(self._init_weights)
         self.teacher = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
                                mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
                                drop_path_rate, norm_layer, norm_skes_loss, is_teacher=True)
-        # self.student = Encoder(dim_in, dim_feat, decoder_dim_feat, depth, decoder_depth, num_heads, 
-        #                        mlp_ratio, num_frames, num_joints, patch_size, t_patch_size, qkv_bias, qk_scale, drop_rate, attn_drop_rate, 
-        #                        drop_path_rate, norm_layer, norm_skes_loss, is_teacher=False)
         self.student = copy.deepcopy(self.teacher)
         for param in self.student.parameters():
             param.requires_grad = True
         self.student.is_teacher = False
         self.teacher.is_teacher = True
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
     def extract_motion(self, x, motion_stride=1):
-        """
-        imgs: [NM, T, V, 3]
-        """
-        # generate motion
         x_motion = torch.zeros_like(x)
         x_motion[:, :-motion_stride, :, :] = x[:, motion_stride:, :, :] - x[:, :-motion_stride, :, :]
         x_motion[:, -motion_stride:, :, :] = 0
         return x_motion
-    
+
     def patchify(self, imgs):
         NM, T, V, C = imgs.shape
         p = self.patch_size
@@ -341,92 +329,58 @@ class Model(nn.Module):
         x = x.reshape(shape=(NM, TP * VP, u * p * C))
         return x
 
-    def predictor(self, x, list_of_masks):
-        """
-        x: [B, N_vis, C]
-        list_of_masks: 假设里边有 k 个不同的mask,每个mask表示要预测的N_mask个位置
-        """
+    def predictor(self, x, mask):
         B, N_vis, C_in = x.shape
-        k = len(list_of_masks)
-
-        # 1) 先把可见 token 重复 k 次
         x = self.decoder_embed(x)
-        x = x.repeat(k, 1, 1)  # -> [k*B, N_vis, C_dec]
 
-        # 2) 为每个 mask 生成 mask tokens
-        #    假设 list_of_masks[i] ~ shape: [B, N_mask_i]
-        #    则拼一起 => [k*B, sum_of(N_mask_i), C_dec] (可根据需要分多次拼接)
-        #    这里仅做示例，假设每个mask大小一样
-        N_mask = list_of_masks[0].shape[1]  # 每个mask大小都一样的话
-        # ...
-        mask_tokens = self.mask_token.repeat(k*B, N_mask, 1)
-
-        # 3) 拼接
+        N_mask = mask.shape[1]
+        mask_tokens = self.mask_token.repeat(B, N_mask, 1)
         x_cat = torch.cat([x, mask_tokens], dim=1)
 
-        # 4) Decoder
         for blk in self.decoder_blocks:
             x_cat = blk(x_cat)
         x_cat = self.decoder_norm(x_cat)
-
-        # 5) 只拿后面的 mask 部分 => [k*B, N_mask, C_dec]
         x_mask_out = x_cat[:, N_vis:, :]
-
         x_mask_out = self.decoder_pred(x_mask_out)
         
         return x_mask_out
 
-
-    def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore, ema_decay=0.999):
-        # contrastive loss between student latent after prediction and teacher latent
-        
-
+    def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore):
         recon_loss_latent = F.mse_loss(student_latent, teacher_latent, reduction='none')
-        
-        # recon_loss_latent = (recon_loss_latent.mean(dim=-1) * mask).sum() / mask.sum()
-        
-        # original motion from target
-        target = self.patchify(target) # [NM, TP * VP, C]
+        target = self.patchify(target)
 
         if self.norm_skes_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var + 1.0e-6) ** 0.5
-        # decode teacher motion into original motion
-        # contrastive_loss_original = F.mse_loss(target, student_orginal_motion, reduction='none')
+
         contrastive_loss_original = F.mse_loss(target, target, reduction='none')
         recon_loss = recon_loss_latent.mean()
         return recon_loss, recon_loss_latent.mean(), contrastive_loss_original.mean()
-    
-    def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75, **kwargs):
-        
+
+    def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75):
         N, C, T, V, M = x.shape
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
         x_motion = self.extract_motion(x, motion_stride)
-        # x_embed = self.joints_embed(x)
-        # get teacher latent from teacher encoder
-        teacher_latent, maskteacher, ids_restoreteacher = self.teacher(x,mask_ratio=0.0, motion_aware_tau=0.0)
-        # get student latent from student encoder after masking
-        student_latent, mask, ids_restore= self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
-        # predict student latent using predictor
-        teacher_latent = F.layer_norm(teacher_latent, (teacher_latent.shape[-1],))
+
+        teacher_latent, maskteacher, ids_restoreteacher, ids = self.teacher(x, mask_ratio=0.0, motion_aware_tau=0.0)
+        student_latent, mask, ids_restore, ids_keep = self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
+        
+        teacher_latent = F.layer_norm(teacher_latent, (teacher_latent.size(-1),))
         teacher_latent = apply_masks(teacher_latent, mask)
         student_latent_predicted = self.predictor(student_latent, mask)
-        # print('student_latent_predicted ', student_latent_predicted .shape)
-        # print('teacher_latent', teacher_latent.shape)
-        loss,loss1,loss2 = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
-        
-        return loss, loss1, loss2
 
+        loss, loss1, loss2 = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
+
+        return loss, loss1, loss2
 
 class Encoder(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
                  depth=5, decoder_depth=5, num_heads=8, mlp_ratio=4,
                  num_frames=120, num_joints=25, patch_size=1, t_patch_size=4,
                  qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, norm_skes_loss=False,mask_ratio=0.0, motion_aware_tau=0.0,is_teacher=True):
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, norm_skes_loss=False, mask_ratio=0.0, motion_aware_tau=0.0, is_teacher=True):
         super().__init__()
-        # MAE decoder specifics
         self.joints_embed = SkeleEmbed(dim_in, dim_feat, num_frames, num_joints, patch_size, t_patch_size)
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -435,22 +389,21 @@ class Encoder(nn.Module):
                 dim=dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
-        self.norm = norm_layer(dim_feat)
 
-        self.temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, dim_feat))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints//patch_size, dim_feat))
+        self.norm = norm_layer(dim_feat)
+        self.temp_embed = nn.Parameter(torch.zeros(1, num_frames // t_patch_size, 1, dim_feat))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints // patch_size, dim_feat))
         trunc_normal_(self.temp_embed, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
-        # Copy the encoder components from the parent without sharing paramete
-        
+
         self.patch_size = patch_size
         self.t_patch_size = t_patch_size
         self.mask_ratio = mask_ratio
         self.motion_aware_tau = motion_aware_tau
         self.is_teacher = is_teacher
-        # Initialize weights
+        
         self.apply(self.init_weights)
-        # Make teacher parameters not trainable
+
         if self.is_teacher:
             for param in self.parameters():
                 param.requires_grad = False
@@ -461,18 +414,14 @@ class Encoder(nn.Module):
                 param.requires_grad = True
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # we use xavier_uniform following official JAX ViT:
             torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
     def patchify(self, imgs):
-        """
-        imgs: (N, T, V, 3)
-        x: (N, L, t_patch_size * patch_size * 3)
-        """
         NM, T, V, C = imgs.shape
         p = self.patch_size
         u = self.t_patch_size
@@ -486,102 +435,70 @@ class Encoder(nn.Module):
         return x
 
     def motion_aware_random_masking(self, x, x_orig, mask_ratio, tau):
-        """
-        Perform per-sample random masking by per-sample shuffling.
-        Per-sample shuffling is done by argsort random noise.
-        x: [NM, L, D], sequence
-        x_orig: patchified original skeleton sequence
-        """
-        NM, L, D = x.shape  # batch, length, dim
+        NM, L, D = x.shape
         _, TP, VP, _ = x_orig.shape
-            
         len_keep = int(L * (1 - mask_ratio))
 
         x_orig_motion = torch.zeros_like(x_orig)
         x_orig_motion[:, 1:, :, :] = torch.abs(x_orig[:, 1:, :, :] - x_orig[:, :-1, :, :])
         x_orig_motion[:, 0, :, :] = x_orig_motion[:, 1, :, :]
-        x_orig_motion = x_orig_motion.mean(dim=[3])  # NM, TP, VP
+        x_orig_motion = x_orig_motion.mean(dim=[3])
         x_orig_motion = x_orig_motion.reshape(NM, L)
 
         x_orig_motion = x_orig_motion / (torch.max(x_orig_motion, dim=-1, keepdim=True).values * tau + 1e-10)
         x_orig_motion_prob = F.softmax(x_orig_motion, dim=-1)
 
-        noise = torch.log(x_orig_motion_prob) - torch.log(-torch.log(torch.rand(NM, L, device=x.device) + 1e-10) + 1e-10)  # Gumbel noise
+        noise = torch.log(x_orig_motion_prob) - torch.log(-torch.log(torch.rand(NM, L, device=x.device) + 1e-10) + 1e-10)
 
-        # sort noise for each sample
-        ids_shuffle = torch.argsort(
-            noise, dim=1
-        )  # ascend: small is keep, large is remove
+        ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
-        # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([NM, L], device=x.device)
         mask[:, :len_keep] = 0
-        # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_masked, mask, ids_restore, ids_keep
 
     def random_masking(self, x, mask_ratio):
-        """
-        Perform per-sample random masking by per-sample shuffling.
-        Per-sample shuffling is done by argsort random noise.
-        x: [N, L, D], sequence
-        """
-        N, L, D = x.shape  # batch, length, dim
+        N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
 
-        noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
-
-        # sort noise for each sample
-        ids_shuffle = torch.argsort(
-            noise, dim=1
-        )  # ascend: small is keep, large is remove
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
-        # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
 
-        # generate the binary mask: 0 is keep, 1 is remove
         mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0
-        # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_masked, mask, ids_restore, ids_keep
 
-    def forward_encoder(self,x, mask_ratio, motion_aware_tau):
-        
+    def forward_encoder(self, x, mask_ratio, motion_aware_tau):
         x_orig = self.patchify(x)
-
-        # embed skeletons
         x = self.joints_embed(x)
 
         NM, TP, VP, _ = x.shape
-
-        # add pos & temp embed
         x = x + self.pos_embed[:, :, :VP, :] + self.temp_embed[:, :TP, :, :]
 
-        # masking: length -> length * mask_ratio
         x = x.reshape(NM, TP * VP, -1)
         if motion_aware_tau > 0:
             x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
-            x, mask, ids_restore, _ = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+            x, mask, ids_restore, ids_keep = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
         else:   
-            x, mask, ids_restore, _ = self.random_masking(x, mask_ratio)
+            x, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
 
-        # apply Transformer blocks
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
 
         x = self.norm(x)
 
-        return x, mask, ids_restore
+        return x, mask, ids_restore, ids_keep
 
     def forward(self, x, mask_ratio=0.0, motion_aware_tau=0.0):
         if self.is_teacher:
