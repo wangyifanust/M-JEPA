@@ -226,8 +226,12 @@ class VICRegLoss(nn.Module):
         # Covariance term (decorrelate features)
         x = x - x.mean(dim=0)
         y = y - y.mean(dim=0)
+        # print('x', x.shape)
+        # print('y', y.shape)
         cov_x = (x.T @ x) / (x.shape[0] - 1)
+        # print('cov_x', cov_x.shape)
         cov_y = (y.T @ y) / (y.shape[0] - 1)
+        # print('cov_y', cov_y.shape)
         cov_loss = (cov_x.pow(2).sum() - torch.diagonal(cov_x).pow(2).sum()) / x.shape[1]
         cov_loss += (cov_y.pow(2).sum() - torch.diagonal(cov_y).pow(2).sum()) / y.shape[1]
 
@@ -340,12 +344,14 @@ class Model(nn.Module):
         for blk in self.decoder_blocks:
             x_cat = blk(x_cat)
         x_cat = self.decoder_norm(x_cat)
+
         x_mask_out = x_cat[:, N_vis:, :]
-        # print('x_mask_out1', x_mask_out.shape)
-        x_mask_out = self.decoder_pred(x_mask_out)
+        # # print('x_mask_out1', x_mask_out.shape)
+        # x_mask_out = self.decoder_pred(x_mask_out)
         # print('x_mask_out2', x_mask_out.shape)
         
         return x_mask_out
+
 
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore):
 
@@ -353,14 +359,21 @@ class Model(nn.Module):
         recon_loss = (recon_loss_latent.mean(dim=-1) * mask).sum() /  (mask.sum() + 1e-8)
         target = self.patchify(target)
 
-        if self.norm_skes_loss:
-            mean = target.mean(dim=-1, keepdim=True)
-            var = target.var(dim=-1, keepdim=True)
-            target = (target - mean) / (var + 1.0e-6) ** 0.5
+        # if self.norm_skes_loss:
+        #     mean = target.mean(dim=-1, keepdim=True)
+        #     var = target.var(dim=-1, keepdim=True)
+        #     target = (target - mean) / (var + 1.0e-6) ** 0.5
 
-        contrastive_loss_original = F.mse_loss(target, target, reduction='none')
-        recon_loss = recon_loss_latent.mean()
-        return recon_loss, recon_loss_latent.mean(), contrastive_loss_original.mean()
+        # contrastive_loss_original = F.mse_loss(target, target, reduction='none')
+        VICRegLoss_fn = VICRegLoss()
+        vicloss = 0 
+        for i in range(0, student_latent.shape[0]):
+            vicloss += VICRegLoss_fn(student_latent[i], teacher_latent[i])
+        contrastive_loss = vicloss / (student_latent.shape[0])
+        # print('contrastive_loss', contrastive_loss.shape)
+        beta = 0.001
+        recon_loss = recon_loss + beta * contrastive_loss
+        return recon_loss, recon_loss_latent.mean(), contrastive_loss
 
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75):
         N, C, T, V, M = x.shape
@@ -371,15 +384,7 @@ class Model(nn.Module):
         student_latent, mask, ids_restore, ids_keep = self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
         
         teacher_latent = F.layer_norm(teacher_latent, (teacher_latent.size(-1),))
-        # print('teacher_latent', teacher_latent.shape)
-        # print('ids_keep', ids_keep.shape)
-        # print('mask', mask.shape)
-        # teacher_latent = torch.gather(
-        #     teacher_latent, 
-        #     dim=1, 
-        #     index=ids_keep.unsqueeze(-1).repeat(1, 1, teacher_latent.size(-1))
-        # )
-        # print('teacher_latent', teacher_latent.shape)
+     
         student_latent_predicted = self.predictor(student_latent, mask)
         # print('student_latent_predicted', student_latent_predicted.shape)
 
