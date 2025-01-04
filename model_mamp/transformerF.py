@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 import warnings
 from .drop import DropPath
+from einops import rearrange
 
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
@@ -215,6 +216,7 @@ class VICRegLoss(nn.Module):
         self.eps = eps
 
     def forward(self, x, y):
+        
         # Invariance term (mean squared error)
         sim_loss = F.mse_loss(x, y)
 
@@ -238,18 +240,6 @@ class VICRegLoss(nn.Module):
         # Total loss
         loss = self.sim_coeff * sim_loss + self.var_coeff * var_loss + self.cov_coeff * cov_loss
         return loss
-    
-# def apply_masks(x, masks):
-#     """
-#     :param x: tensor of shape [B (batch-size), N (num-patches), D (feature-dim)]
-#     :param masks: list of tensors containing indices of patches in [N] to keep
-#     """
-#     all_x = []
-#     for m in masks:
-#         mask_keep = m.unsqueeze(-1).repeat(1, 1, x.size(-1)).to(dtype=torch.int64)
-
-#         all_x += [torch.gather(x, dim=1, index=mask_keep)]
-#     return torch.cat(all_x, dim=0)
 
 class Model(nn.Module):
     def __init__(self, dim_in=3, dim_feat=256, decoder_dim_feat=256,
@@ -276,17 +266,17 @@ class Model(nn.Module):
         trunc_normal_(self.pos_embed, std=.02)
 
         # MAE Decoder specifics
-        self.decoder_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
+        self.predictor_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim_feat))
         trunc_normal_(self.mask_token, std=.02)
-
-        self.decoder_blocks = nn.ModuleList([
+        self.VICRegLoss_fn = VICRegLoss()
+        self.predictor_blocks = nn.ModuleList([
             Block(
                 dim=decoder_dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(decoder_depth)])
 
-        self.decoder_norm = norm_layer(decoder_dim_feat)
+        self.predictor_norm = norm_layer(decoder_dim_feat)
 
         self.decoder_temp_embed = nn.Parameter(torch.zeros(1, num_frames // t_patch_size, 1, decoder_dim_feat))
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints // patch_size, decoder_dim_feat))
@@ -333,24 +323,40 @@ class Model(nn.Module):
         x = x.reshape(shape=(NM, TP * VP, u * p * C))
         return x
 
-    def predictor(self, x, mask):
-        B, N_vis, C_in = x.shape
-        x = self.decoder_embed(x)
+    def predictor(self, x, ids_restore):
+        # predict the student latent 
+        NM = x.shape[0]
+        TP = self.joints_embed.t_grid_size
+        VP = self.joints_embed.grid_size
 
-        N_mask = mask.shape[1]
-        mask_tokens = self.mask_token.repeat(B, N_mask, 1)
-        x_cat = torch.cat([x, mask_tokens], dim=1)
+        # embed tokens
+        x = self.predictor_embed(x)
+        C = x.shape[-1]
+        # append intra mask tokens to sequence
+        mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
+        x_ = torch.cat([x, mask_tokens], dim=1)# no cls token
+        # print('x_', x_.shape)
+        # print('ids_restore', ids_restore.shape)
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x_.shape[2]))# unshuffle
 
-        for blk in self.decoder_blocks:
-            x_cat = blk(x_cat)
-        x_cat = self.decoder_norm(x_cat)
+        x = x_.view([NM, TP, VP, C])
+        # add pos & temp embed
+        x = x + self.decoder_pos_embed[:, :, :VP, :] + self.decoder_temp_embed[:, :TP, :, :]
+        # apply Transformer blocks
+        x = x.reshape(NM, TP * VP, C)
 
-        x_mask_out = x_cat[:, N_vis:, :]
-        # # print('x_mask_out1', x_mask_out.shape)
-        # x_mask_out = self.decoder_pred(x_mask_out)
-        # print('x_mask_out2', x_mask_out.shape)
-        
-        return x_mask_out
+        # predict_latent = []
+        for blk in self.predictor_blocks:
+            x = blk(x)
+            # predict_latent.append(x)
+
+        x = self.predictor_norm(x)
+        # predict_latent.append(x)
+        # predict_latent = torch.stack(predict_latent[-4:], dim=0)
+    
+        x = self.decoder_pred(x)
+    
+        return  x
 
 
     def forward_loss(self, student_latent, teacher_latent, target, mask, ids_restore):
@@ -365,31 +371,46 @@ class Model(nn.Module):
         #     target = (target - mean) / (var + 1.0e-6) ** 0.5
 
         # contrastive_loss_original = F.mse_loss(target, target, reduction='none')
-        VICRegLoss_fn = VICRegLoss()
+        
         vicloss = 0 
-        for i in range(0, student_latent.shape[0]):
-            vicloss += VICRegLoss_fn(student_latent[i], teacher_latent[i])
-        contrastive_loss = vicloss / (student_latent.shape[0])
+        # 假设 student_latent, teacher_latent 都是 [N, L, D]
+        student_latent_2d = student_latent * mask.unsqueeze(-1)  # => [N, L, D]
+        teacher_latent_2d = teacher_latent * mask.unsqueeze(-1)  # => [N, L, D]
+        
+        student_latent_2d = student_latent.reshape(-1, student_latent.size(-1))  # => [N*L, D]
+        teacher_latent_2d = teacher_latent.reshape(-1, teacher_latent.size(-1))  # => [N*L, D]
+        
+        vicreg_loss = self.VICRegLoss_fn(student_latent_2d, teacher_latent_2d)
+
+    
+        # for i in range(0, student_latent.shape[0]):
+        #     vicloss += self.VICRegLoss_fn(student_latent[i], teacher_latent[i])
+        # vicreg_loss = vicloss / (student_latent.shape[0])
+        # student_latent = student_latent.view(student_latent.shape[0], -1)
+        # teacher_latent = teacher_latent.view(teacher_latent.shape[0], -1)
+        # contrastive_loss = VICRegLoss_fn(student_latent, teacher_latent)
         # print('contrastive_loss', contrastive_loss.shape)
-        beta = 0.001
-        recon_loss = recon_loss + beta * contrastive_loss
-        return recon_loss, recon_loss_latent.mean(), contrastive_loss
+        beta = 0.005
+        recon_loss = recon_loss + beta * vicreg_loss 
+        return recon_loss, recon_loss_latent.mean(), vicreg_loss
 
     def forward(self, x, mask_ratio=0.80, motion_stride=1, motion_aware_tau=0.75):
         N, C, T, V, M = x.shape
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(N * M, T, V, C)
         x_motion = self.extract_motion(x, motion_stride)
 
-        teacher_latent, maskteacher, ids_restoreteacher, ids = self.teacher(x, mask_ratio=0.0, motion_aware_tau=0.0)
-        student_latent, mask, ids_restore, ids_keep = self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
+        teacher_latent, latent1,maskteacher, ids_restoreteacher, ids = self.teacher(x, mask_ratio=0.0, motion_aware_tau=0.0)
+        student_latent, latent2, mask, ids_restore, ids_keep = self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
         
         teacher_latent = F.layer_norm(teacher_latent, (teacher_latent.size(-1),))
-     
-        student_latent_predicted = self.predictor(student_latent, mask)
+        latent1 = [F.layer_norm(latent.float(), latent.shape[-1:]) for latent in latent1]
+        latent1 = sum(latent1) / len(latent1)
+        latent1 = F.layer_norm(latent1.float(), latent1.shape[-1:])
+        student_latent_predicted = self.predictor(student_latent, ids_restore)
         # print('student_latent_predicted', student_latent_predicted.shape)
 
-        loss, loss1, loss2 = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
-
+        # loss, loss1, loss2 = self.forward_loss(student_latent_predicted, teacher_latent, x_motion, mask, ids_restore)
+        loss, loss1, loss2 = self.forward_loss(student_latent_predicted, latent1, x_motion, mask, ids_restore)
         return loss, loss1, loss2
 
 class Encoder(nn.Module):
@@ -413,15 +434,25 @@ class Encoder(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints // patch_size, dim_feat))
         trunc_normal_(self.temp_embed, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
-
+        spatio_size=25
+        temporal_size=120
+        temporal_segment_size=4
         self.patch_size = patch_size
         self.t_patch_size = t_patch_size
         self.mask_ratio = mask_ratio
         self.motion_aware_tau = motion_aware_tau
         self.is_teacher = is_teacher
+        self.spatio_size = spatio_size
         
         self.apply(self.init_weights)
-
+        print(f"Initializing Encoder with temporal_size={temporal_size} (type: {type(temporal_size)})")
+        print(f"Initializing Encoder with temporal_segment_size={temporal_segment_size} (type: {type(temporal_segment_size)})")
+        self.temporal_size = int(temporal_size)
+        self.temporal_segment_size = int(temporal_segment_size)
+        self.temporal_segments= int(temporal_size // temporal_segment_size)
+        # Type Assertions
+        # assert isinstance(temporal_size, int), f"temporal_size must be int, got {type(temporal_size)}"
+        # assert isinstance(temporal_segment_size, int), f"temporal_segment_size must be int, got {type(temporal_segment_size)}"
         if self.is_teacher:
             for param in self.parameters():
                 param.requires_grad = False
@@ -479,7 +510,43 @@ class Encoder(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_masked, mask, ids_restore, ids_keep
+    
+    def tube_masking(self, x, mask_ratio, tube_len=5):
+        N, L, D = x.shape  # batch, length, dim
+        VP, TP = self.spatio_size, self.temporal_segments
+        len_VP_keep = int(VP * (1 - mask_ratio))
 
+        # Divide the dimension of time into several tubes
+        assert TP % tube_len == 0
+        TP_ = TP // tube_len
+        noise = torch.rand(N, TP_, VP, device=x.device)  # noise in [0, 1]
+
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(
+            noise, dim=-1
+        )  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=-1)
+
+        # Fill the tubes to restore the original dimension of time
+        ids_shuffle = ids_shuffle.repeat_interleave(tube_len, dim=1)
+        ids_restore = ids_restore.repeat_interleave(tube_len, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :, :len_VP_keep]
+        x_masked = torch.gather(x.view(N, TP, VP, D), dim=2,
+                                index=ids_keep.unsqueeze(-1).repeat(1, 1, 1, D))
+        x_masked = rearrange(x_masked, 'n t v d -> n (t v) d')
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, TP, VP], device=x.device)
+        mask[:, :, :len_VP_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=2, index=ids_restore)
+        mask = rearrange(mask, 'n t v -> n (t v)')
+        ids_restore = rearrange(ids_restore, 'n t v -> n (t v)')
+        
+        return x_masked, mask, ids_restore, ids_keep
+    
     def random_masking(self, x, mask_ratio):
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
@@ -494,7 +561,9 @@ class Encoder(nn.Module):
         mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
-
+        # print('mask', mask.shape)
+        # print('masked', x_masked.shape)
+        # ids_restore = ids_restore.reshape(N, L, 1)
         return x_masked, mask, ids_restore, ids_keep
 
     def forward_encoder(self, x, mask_ratio, motion_aware_tau):
@@ -506,17 +575,23 @@ class Encoder(nn.Module):
 
         x = x.reshape(NM, TP * VP, -1)
         if motion_aware_tau > 0:
-            x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
-            x, mask, ids_restore, ids_keep = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
+            # x, mask, ids_restore, ids_keep = self.tube_masking(x, mask_ratio)
+            # x_orig = x_orig.reshape(shape=(NM, TP, VP, -1))
+            x, mask, ids_restore, ids_keep = self.tube_masking(x, mask_ratio)
+            # x, mask, ids_restore, ids_keep = self.motion_aware_random_masking(x, x_orig, mask_ratio, motion_aware_tau)
         else:   
-            x, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
+            x1, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
 
+        latent = []
         for idx, blk in enumerate(self.blocks):
             x = blk(x)
+            latent.append(x)
 
         x = self.norm(x)
+        # latent = torch.stack(latent[-4:], dim=0)
+        latent = latent[-4:]
 
-        return x, mask, ids_restore, ids_keep
+        return x, latent, mask, ids_restore, ids_keep
 
     def forward(self, x, mask_ratio=0.0, motion_aware_tau=0.0):
         if self.is_teacher:

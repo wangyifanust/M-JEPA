@@ -5,6 +5,7 @@ import math
 import warnings
 from .drop import DropPath
 import copy
+from einops import rearrange
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
@@ -284,7 +285,7 @@ class Transformer(nn.Module):
                                qkv_bias=qkv_bias, qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
                                drop_path_rate=drop_path_rate, norm_layer=norm_layer, is_teacher=True, protocol=protocol)
         self.student = copy.deepcopy(self.teacher)
-        self.decoder_blocks = nn.ModuleList([
+        self.predictor_blocks = nn.ModuleList([
             Block(
                 dim=decoder_dim_feat, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
@@ -295,13 +296,14 @@ class Transformer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(decoder_depth)])
         self.decoder_norm2 = norm_layer(decoder_dim_feat)
-        self.decoder_norm = norm_layer(decoder_dim_feat)
-        self.decoder_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
+        self.predictor_norm = norm_layer(decoder_dim_feat)
+        self.predictor_embed = nn.Linear(dim_feat, decoder_dim_feat, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim_feat))
         self.decoder_temp_embed = nn.Parameter(torch.zeros(1, num_frames//t_patch_size, 1, decoder_dim_feat))
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1, num_joints//patch_size, decoder_dim_feat))
         trunc_normal_(self.decoder_temp_embed, std=.02)
         trunc_normal_(self.decoder_pos_embed, std=.02)
+        self.decoder_pred = nn.Linear(decoder_dim_feat, dim_feat, bias=True)
 
 
     def _init_weights(self, m):
@@ -320,7 +322,7 @@ class Transformer(nn.Module):
         VP = self.joints_embed.grid_size
 
         # embed tokens
-        x = self.decoder_embed(x)
+        x = self.predictor_embed(x)
         C = x.shape[-1]
         # append intra mask tokens to sequence
         mask_tokens = self.mask_token.repeat(NM, TP * VP - x.shape[1], 1)
@@ -335,16 +337,17 @@ class Transformer(nn.Module):
         x = x.reshape(NM, TP * VP, C)
 
         predict_latent = []
-        for blk in self.decoder_blocks:
+        for blk in self.predictor_blocks:
             x = blk(x)
-            predict_latent.append(x)
+            # predict_latent.append(x)
 
-        x = self.decoder_norm(x)
-        # predict_latent.append(x)
-        predict_latent = torch.stack(predict_latent)
+        x = self.predictor_norm(x)
+        predict_latent.append(x)
+        # predict_latent = torch.stack(predict_latent)
     
-        # x = self.decoder_pred(x)
+        x = self.decoder_pred(x)
     
+        # return  x
         return predict_latent, x
     def forward(self, x, mask_ratio=0.80, motion_aware_tau=0.75, **kwargs):
         N, C, T, V, M = x.shape
@@ -356,7 +359,7 @@ class Transformer(nn.Module):
         # embed skeletons
         # self.teacher= self.set_teacher()
         x,_,_ = self.teacher(x, mask_ratio=0.0, motion_aware_tau=0.0)
-        # x,mask,ids_restore = self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
+        # x, mask, ids_restore = self.student(x, mask_ratio=mask_ratio, motion_aware_tau=motion_aware_tau)
         # student_latent3, x = self.predictor(x, ids_restore)
         x = x.reshape(N, M, TP, VP, -1)
         x = self.head(x)
@@ -472,6 +475,40 @@ class Encoder(nn.Module):
         mask[:, :len_keep] = 0
         # unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        return x_masked, mask, ids_restore, ids_keep
+    def tube_masking(self, x, mask_ratio, tube_len):
+        N, L, D = x.shape  # batch, length, dim
+        VP, TP = self.spatio_size, self.temporal_segments
+        len_VP_keep = int(VP * (1 - mask_ratio))
+
+        # Divide the dimension of time into several tubes
+        assert TP % tube_len == 0
+        TP_ = TP // tube_len
+        noise = torch.rand(N, TP_, VP, device=x.device)  # noise in [0, 1]
+
+        # sort noise for each sample
+        ids_shuffle = torch.argsort(
+            noise, dim=-1
+        )  # ascend: small is keep, large is remove
+        ids_restore = torch.argsort(ids_shuffle, dim=-1)
+
+        # Fill the tubes to restore the original dimension of time
+        ids_shuffle = ids_shuffle.repeat_interleave(tube_len, dim=1)
+        ids_restore = ids_restore.repeat_interleave(tube_len, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :, :len_VP_keep]
+        x_masked = torch.gather(x.view(N, TP, VP, D), dim=2,
+                                index=ids_keep.unsqueeze(-1).repeat(1, 1, 1, D))
+        x_masked = rearrange(x_masked, 'n t v d -> n (t v) d')
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, TP, VP], device=x.device)
+        mask[:, :, :len_VP_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=2, index=ids_restore)
+        mask = rearrange(mask, 'n t v -> n (t v)')
 
         return x_masked, mask, ids_restore, ids_keep
 

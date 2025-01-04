@@ -27,7 +27,7 @@ nvidia-smi
 nvcc --version
 
 
-torchrun --nproc_per_node=4   --master_port 11234 main_pretrain.py \
+torchrun --nproc_per_node=4  --master_port 11234 main_pretrain.py \
 --config ./config/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_mask90.yaml \
 --output_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_Linear_MSE_archCv4 \
 --log_dir /work/vita/datasets/output_dir/ntu60_xsub_joint/pretrain_mamp_t120_layer8+3_drop0.0_mask90_tau0.80_ep600_noamp_Linear_MSE_archCv4 \
